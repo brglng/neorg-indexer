@@ -1,6 +1,6 @@
-# neorg-auto-summary
+# neorg-indexer
 
-Automatic summary generation for Neorg.
+Automatic category index generation for Neorg.
 
 ## Installation
 
@@ -12,71 +12,91 @@ Add the following to your Neorg plugin configuration:
 {
     "nvim-neorg/neorg",
     dependencies = {
-        "brglng/neorg-auto-summary",
+        "brglng/neorg-indexer",
     },
     opts = {
         load = {
             ["core.defaults"] = {},
-            ["external.auto-summary"] = {
+            ["external.indexer"] = {
                 config = {
-                    name = "index.norg",            -- Name of the main summary file
-                    summary_on_launch = false,       -- Whether to generate summaries when the module is loaded
-                    update_on_change = false,        -- Whether to create an autocommand to update the summary on save
-                    category_separator = ".",        -- Separator for sub-categories (e.g. "a.b.c")
-                    per_category_summary = true,     -- Put each sub-category summary in a separate file
-                    categories_dir = "categories",   -- Root subdirectory for sub-category summary files
-                    list_subcategory_notes = true, -- List all descendant notes under a separate "Notes" heading
-                    inject_metadata = false,         -- Generate metadata at the top of summary files
-                    sort_by = "alphabetical",        -- How to sort: "alphabetical", "created", or "updated"
-                    sort_direction = "ascending",    -- Sort direction: "ascending" or "descending"
-                    format_note_title = function(meta) -- Custom note title formatting callback
-                        return meta.title
-                    end,
-                }
+                    categories = {
+                        name = "index.norg",
+                        dir = "categories",
+                        index_on_launch = false,
+                        index_on_change = true,
+                        subcategory_separator = "/",
+                        per_subcategory_index = true,
+                        list_subcategory_notes = true,
+                        sort_by = "alphabetical",
+                        sort_direction = "ascending",
+                        title_formatter = function(meta)
+                            return meta.title
+                        end,
+                    },
+                },
             },
         },
-    }
+    },
 }
+```
+
+The `core.esupports.metagen` configuration controls metadata generated for index files. For example:
+
+```lua
+["core.esupports.metagen"] = {
+    config = {
+        type = "auto", -- "auto", "empty", or "none"
+    },
+},
 ```
 
 ## Usage
 
-`:Neorg auto-summary`
+Run `:Neorg indexer` to generate the index for the current workspace.
 
 ## Configuration
 
+All current indexing options are grouped under `config.categories`, leaving room for future indexers based on other metadata fields.
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `name` | string | `"index.norg"` | Name of the main summary file. |
-| `summary_on_launch` | boolean | `false` | When `true`, automatically generates summaries for all workspaces when the module is loaded. |
-| `update_on_change` | boolean | `false` | When `true`, automatically regenerates the summary on every `.norg` file save. |
-| `category_separator` | string | `"."` | Separator for sub-categories in the `categories` metadata field. For example, `"a.b.c"` splits into three levels. |
-| `per_category_summary` | boolean | `true` | When `true`, each sub-category summary is written to a separate file under the `categories_dir`. When `false`, sub-categories are rendered as nested headings in the main summary file. |
-| `categories_dir` | string | `"categories"` | Root subdirectory (relative to workspace root) where sub-category summary files are stored. Only used when `per_category_summary` is `true`. |
-| `list_subcategory_notes` | boolean | `true` | When `true`, a separate "Notes" heading is added to summary files listing all descendant norg files flattened. In file mode (`per_category_summary` is `true`), the first heading contains only sub-category links and the second heading "Notes" lists all descendant entries. In inline mode (`per_category_summary` is `false`), all descendant entries are flattened under each heading without sub-headings. When `false`, the "Notes" heading is not generated; in file mode, sub-category links are shown and individual category files include their direct entries, while in inline mode only notes directly categorized under each category are listed. |
-| `inject_metadata` | boolean | `false` | When `true`, generates `@document.meta` at the top of summary files. For new files, fresh metadata is created via the metagen API. For existing files without metadata, it is added. For existing files with metadata whose body content changed, the `updated` timestamp is refreshed. |
-| `sort_by` | string | `"alphabetical"` | How to sort headings and note entries. `"alphabetical"` sorts by title, `"created"` sorts by the note's `created` metadata timestamp, `"updated"` sorts by the note's `updated` metadata timestamp. Category headings are always sorted alphabetically. |
-| `sort_direction` | string | `"ascending"` | Sort direction: `"ascending"` (A→Z or oldest→newest) or `"descending"` (Z→A or newest→oldest). |
-| `format_note_title` | function | `function(meta) return meta.title end` | A callback function that receives the note's normalized metadata table and returns a formatted title string. The metadata table contains fields such as `title`, `description`, `categories`, `created`, `updated`, etc. |
+| `name` | string | `"index.norg"` | Name of the main category index file. |
+| `dir` | string | `"categories"` | Root directory for per-subcategory index files, relative to the workspace root. |
+| `index_on_launch` | boolean | `false` | When `true`, generate indexes when the module is loaded. |
+| `index_on_change` | boolean | `true` | When `true`, regenerate indexes when workspace `.norg` files change. |
+| `subcategory_separator` | string | `"/"` | Separator for hierarchical values in the `categories` metadata field, such as `"a/b/c"`. |
+| `per_subcategory_index` | boolean | `true` | When `true`, write each subcategory index to a separate file. When `false`, render the hierarchy in the main index. |
+| `list_subcategory_notes` | boolean | `true` | When `true`, add a `Notes` heading containing descendant notes. When `false`, list only direct notes under each category. |
+| `sort_by` | string | `"alphabetical"` | Sort note entries by `alphabetical`, `created`, or `updated`. |
+| `sort_direction` | string | `"ascending"` | Sort entries in `ascending` or `descending` order. |
+| `title_formatter` | function | `function(meta) return meta.title end` | Format a note title from its normalized metadata table. |
 
-## Sub-category File Structure
+The indexer does not have a separate metadata-injection option. Generated index metadata follows `core.esupports.metagen`'s `type` setting:
 
-When `per_category_summary` is enabled, category summary files are organized under the `categories_dir`:
+- `"none"` does not create metadata. Existing metadata is preserved.
+- `"auto"` creates metadata when an index file does not already have it.
+- `"empty"` creates metadata only for new index files.
 
-- **All categories**: `<categories_dir>/<path>/<category_name>.norg`
+When existing metadata is regenerated, the metagen `update_date` setting controls whether its `updated` field is refreshed.
 
-For example, given files with categories `a.b.c`, `a.b.d`, `a.e`, and `f`:
+## Subcategory Index Structure
 
-```
+When `per_subcategory_index` is enabled, category index files are organized under `dir`:
+
+- **All categories**: `<dir>/<path>/<category_name>.norg`
+
+For example, given files with categories `a/b/c`, `a/b/d`, `a/e`, and `f`:
+
+```text
 categories/
 ├── a/
 │   ├── b/
-│   │   ├── c.norg          # summary for category "a.b.c"
-│   │   └── d.norg          # summary for category "a.b.d"
-│   ├── b.norg              # summary for category "a.b"
-│   └── e.norg              # summary for category "a.e"
-├── a.norg                  # summary for category "a"
-└── f.norg                  # summary for category "f"
+│   │   ├── c.norg          # index for category "a/b/c"
+│   │   └── d.norg          # index for category "a/b/d"
+│   ├── b.norg              # index for category "a/b"
+│   └── e.norg              # index for category "a/e"
+├── a.norg                  # index for category "a"
+└── f.norg                  # index for category "f"
 ```
 
-Each category's summary file lists its first-level children as headings that link to the corresponding sub-category summary files. When `list_subcategory_notes` is enabled, a separate "Notes" heading is added listing all descendant norg files (sorted and deduplicated according to the `sort_by` and `sort_direction` settings). When disabled, only notes directly categorized under each category are listed (before the sub-category headings), and no "Notes" heading is generated.
+Each category index links to its child indexes and its parent. When `list_subcategory_notes` is enabled, it also lists all descendant notes under a separate `Notes` heading.

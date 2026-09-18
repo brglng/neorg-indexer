@@ -1,14 +1,14 @@
 --[[
     file: module.lua
-    title: Auto Summary Module for Neorg
-    description: Automatically generate summaries for Neorg documents
-    author: neorg-auto-summary
+    title: Indexer Module for Neorg
+    description: Index Neorg documents by category
+    author: neorg-indexer
 --]]
 
 local neorg = require("neorg.core")
 local modules, utils = neorg.modules, neorg.utils
 
-local module = modules.create("external.auto-summary")
+local module = modules.create("external.indexer")
 
 module.setup = function()
     return {
@@ -24,51 +24,51 @@ end
 module.load = function()
     modules.await("core.neorgcmd", function(neorgcmd)
         neorgcmd.add_commands_from_table({
-            ["auto-summary"] = {
+            ["indexer"] = {
                 min_args = 0,
-                name = "auto-summary.summarize",
+                name = "indexer.index",
             },
         })
     end)
-    if module.config.public.summary_on_launch then
+    if module.config.public.categories.index_on_launch then
         modules.await("core.dirman", function(dirman)
-            module.private.trigger_summary_on_launch(dirman)
+            module.private.trigger_index_on_launch(dirman)
         end)
     end
-    if module.config.public.update_on_change then
+    if module.config.public.categories.index_on_change then
         module.private.setup_workspace_watchers()
     end
 end
 
 module.config.public = {
-    name = "index.norg",
-    summary_on_launch = false,
-    update_on_change = false,
-    watch_debounce_ms = 200,
-    category_separator = ".",
-    per_category_summary = true,
-    categories_dir = "categories",
-    list_subcategory_notes = true,
-    inject_metadata = false,
-    sort_by = "alphabetical",
-    sort_direction = "ascending",
-    ---@param meta table normalized metadata of the note
-    ---@return string formatted title
-    format_note_title = function(meta)
-        return meta.title
-    end,
+    categories = {
+        name = "index.norg",
+        dir = "categories",
+        index_on_launch = false,
+        index_on_change = true,
+        subcategory_separator = "/",
+        per_subcategory_index = true,
+        list_subcategory_notes = false,
+        sort_by = "alphabetical",
+        sort_direction = "ascending",
+        ---@param meta table normalized metadata of the note
+        ---@return string formatted title
+        title_formatter = function(meta)
+            return meta.title
+        end,
+    },
 }
 
----@class external.auto-summary
+---@class external.indexer
 module.public = {
-    --- Generate the auto-summary for a workspace.
+    --- Generate the category index for a workspace.
     --- @param ws_name string|nil workspace name; defaults to the current workspace
     --- @param opts table|nil options: { changed_files = string[] }
-    auto_summary = function(ws_name, opts)
+    index = function(ws_name, opts)
         local dirman = modules.get_module("core.dirman")
 
         if not dirman then
-            utils.notify("`core.dirman` is not loaded! It is required to generate summaries", vim.log.levels.ERROR)
+            utils.notify("`core.dirman` is not loaded! It is required to generate indexes", vim.log.levels.ERROR)
             return
         end
 
@@ -81,7 +81,7 @@ module.public = {
         end
 
         if not ws_name or ws_name == "default" then
-            -- Don't generate summary for non-registered workspace (default is cwd)
+            -- Don't generate an index for non-registered workspace (default is cwd)
             return
         end
 
@@ -91,8 +91,8 @@ module.public = {
         end
 
         local ws_norm = vim.fs.normalize(tostring(ws_root))
-        local config = module.config.public
-        local summary_path = vim.fs.normalize(vim.fs.abspath(vim.fn.resolve(ws_norm .. "/" .. config.name)))
+        local config = module.config.public.categories
+        local index_path = vim.fs.normalize(vim.fs.abspath(vim.fn.resolve(ws_norm .. "/" .. config.name)))
 
         opts = opts or {}
         local changed_set = nil
@@ -108,23 +108,23 @@ module.public = {
         end
 
         local cats_dir_abs = nil
-        if config.per_category_summary then
-            cats_dir_abs = vim.fs.normalize(vim.fn.resolve(ws_norm .. "/" .. config.categories_dir))
+        if config.per_subcategory_index then
+            cats_dir_abs = vim.fs.normalize(vim.fn.resolve(ws_norm .. "/" .. config.dir))
         end
 
         -- Collect entries from all norg files
         local categorized, category_order, affected_categories = module.private.collect_entries(
             dirman.get_norg_files(ws_name) or {},
             ws_norm,
-            summary_path,
+            index_path,
             cats_dir_abs,
             changed_set
         )
 
-        if changed_set and config.per_category_summary and cats_dir_abs then
+        if changed_set and config.per_subcategory_index and cats_dir_abs then
             local changed_norgnames = {}
             for path in pairs(changed_set) do
-                if path ~= summary_path
+                if path ~= index_path
                     and path:match("%.norg$")
                     and not (cats_dir_abs and vim.startswith(path, cats_dir_abs .. "/")) then
                     if vim.startswith(path, ws_norm .. "/") then
@@ -138,7 +138,7 @@ module.public = {
                     module.private.find_categories_for_norgnames(ws_norm, cats_dir_abs, changed_norgnames)
                 for cat in pairs(old_categories) do
                     affected_categories[cat] = true
-                    local parts = vim.split(cat, config.category_separator, { plain = true })
+                    local parts = vim.split(cat, config.subcategory_separator, { plain = true })
                     parts = vim.tbl_filter(function(p)
                         return p ~= ""
                     end, parts)
@@ -146,7 +146,7 @@ module.public = {
                         local acc = {}
                         for _, part in ipairs(parts) do
                             table.insert(acc, part)
-                            affected_categories[table.concat(acc, config.category_separator)] = true
+                            affected_categories[table.concat(acc, config.subcategory_separator)] = true
                         end
                     end
                 end
@@ -156,23 +156,23 @@ module.public = {
         local partial_update = changed_set ~= nil and next(affected_categories) ~= nil
 
         -- Build category tree
-        local tree = module.private.build_category_tree(categorized, category_order, config.category_separator)
+        local tree = module.private.build_category_tree(categorized, category_order, config.subcategory_separator)
 
         local write_main = true
-        if config.per_category_summary and not config.list_subcategory_notes and partial_update then
+        if config.per_subcategory_index and not config.list_subcategory_notes and partial_update then
             write_main = module.private.top_level_categories_changed(cats_dir_abs, tree.child_order)
         end
 
-        if config.per_category_summary then
-            -- Generate main summary with links to category files
+        if config.per_subcategory_index then
+            -- Generate main index with links to category indexes
             local main_lines
             if write_main then
-                main_lines = module.private.generate_main_summary_with_files(tree)
+                main_lines = module.private.generate_main_index_lines(tree)
             end
 
             -- Generate all category file contents (relative paths -> body content)
             local category_files =
-                module.private.generate_all_category_files(tree, partial_update and affected_categories or nil)
+                module.private.generate_all_category_index_files(tree, partial_update and affected_categories or nil)
 
             local main_body
             if write_main then
@@ -182,32 +182,18 @@ module.public = {
             -- Prepare content with metadata handling (BEFORE deleting categories dir)
             local files_to_write = {}
 
-            -- Main summary
+            -- Main index
             if write_main then
-                local main_content
-                if config.inject_metadata then
-                    main_content = module.private.prepare_content_with_metadata(summary_path, main_body, "Index")
-                else
-                    local main_metadata = module.private.read_existing_metadata(summary_path)
-                    main_content = main_body
-                    if main_metadata then
-                        main_content = table.concat(main_metadata, "\n") .. "\n\n" .. main_content
-                    end
-                end
-                table.insert(files_to_write, { path = summary_path, content = main_content })
+                local main_content = module.private.prepare_index_content(index_path, main_body, "Index")
+                table.insert(files_to_write, { path = index_path, content = main_content })
             end
 
-            -- Category files (read old data BEFORE directory deletion)
+            -- Category indexes (read old data BEFORE directory deletion)
             local category_contents = {}
             for rel_path, body in pairs(category_files) do
                 local abs_path = vim.fs.normalize(ws_norm .. "/" .. rel_path)
-                if config.inject_metadata then
-                    local cat_title = body:match("^%*+ ([^\n]+)") or vim.fn.fnamemodify(rel_path, ":t:r")
-                    category_contents[abs_path] =
-                        module.private.prepare_content_with_metadata(abs_path, body, cat_title)
-                else
-                    category_contents[abs_path] = body
-                end
+                local category_title = body:match("^%*+ ([^\n]+)") or vim.fn.fnamemodify(rel_path, ":t:r")
+                category_contents[abs_path] = module.private.prepare_index_content(abs_path, body, category_title)
             end
 
             -- Now safe to delete categories directory for full rebuilds only
@@ -216,7 +202,7 @@ module.public = {
                     vim.fn.delete(cats_dir_abs, "rf")
                 end
             elseif affected_categories and next(affected_categories) ~= nil then
-                module.private.delete_obsolete_category_files(ws_norm, tree, affected_categories, config.category_separator)
+                module.private.delete_obsolete_category_files(ws_norm, tree, affected_categories, config.subcategory_separator)
             end
 
             -- Create directories and prepare file entries
@@ -239,41 +225,31 @@ module.public = {
             if #disk_writes > 0 then
                 module.private.write_files_async(disk_writes, function()
                     vim.schedule(function()
-                        utils.notify("Summary generated at " .. summary_path)
+                        utils.notify("Index generated at " .. index_path)
                     end)
                 end)
             else
-                utils.notify("Summary generated at " .. summary_path)
+                utils.notify("Index generated at " .. index_path)
             end
         else
-            -- Generate main summary with tree sub-headings
+            -- Generate the main index with tree sub-headings
             local main_lines = vim.list_extend({ "* Index", "\n" }, module.private.generate_tree_lines(tree, 2))
             local main_body = table.concat(main_lines, "\n") .. "\n"
 
-            -- Handle metadata
-            local content
-            if config.inject_metadata then
-                content = module.private.prepare_content_with_metadata(summary_path, main_body, "Index")
-            else
-                local metadata = module.private.read_existing_metadata(summary_path)
-                content = main_body
-                if metadata then
-                    content = table.concat(metadata, "\n") .. "\n\n" .. content
-                end
-            end
+            local content = module.private.prepare_index_content(index_path, main_body, "Index")
 
             -- Write single file, preferring buffer update if open
-            local bufnr = module.private.find_open_buffer(summary_path)
+            local bufnr = module.private.find_open_buffer(index_path)
             if bufnr then
                 module.private.write_to_buffer(bufnr, content)
-                utils.notify("Summary generated at " .. summary_path)
+                utils.notify("Index generated at " .. index_path)
             else
-                module.private.write_file_async(summary_path, content, function(err)
+                module.private.write_file_async(index_path, content, function(err)
                     vim.schedule(function()
                         if err then
-                            utils.notify("Failed to write summary file: " .. err, vim.log.levels.ERROR)
+                            utils.notify("Failed to write index file: " .. err, vim.log.levels.ERROR)
                         else
-                            utils.notify("Summary generated at " .. summary_path)
+                            utils.notify("Index generated at " .. index_path)
                         end
                     end)
                 end)
@@ -286,13 +262,14 @@ module.private = {
     workspace_watchers = {},
     watch_timers = {},
     pending_changes = {},
-    summary_on_launch_pending = false,
+    index_on_launch_pending = false,
+    watch_debounce_ms = 200,
 
-    --- Attempt to run summary_on_launch once a real workspace is available.
+    --- Attempt to run index_on_launch once a real workspace is available.
     --- @param dirman table|nil
-    --- @return boolean triggered true when a summary was scheduled
-    trigger_summary_on_launch = function(dirman)
-        if not module.config.public.summary_on_launch then
+    --- @return boolean triggered true when an index was scheduled
+    trigger_index_on_launch = function(dirman)
+        if not module.config.public.categories.index_on_launch then
             return false
         end
         dirman = dirman or module.required["core.dirman"]
@@ -301,12 +278,12 @@ module.private = {
         end
         local ws_name = dirman.get_current_workspace()[1]
         if not ws_name or ws_name == "default" then
-            module.private.summary_on_launch_pending = true
+            module.private.index_on_launch_pending = true
             return false
         end
-        module.private.summary_on_launch_pending = false
+        module.private.index_on_launch_pending = false
         vim.schedule(function()
-            module.public.auto_summary(ws_name)
+            module.public.index(ws_name)
         end)
         return true
     end,
@@ -330,13 +307,13 @@ module.private = {
     --- @param ws_root string normalized workspace root
     --- @return boolean
     should_ignore_path = function(filename, ws_root)
-        local config = module.config.public
-        local summary_name = vim.fs.normalize(vim.fn.resolve(ws_root .. "/" .. config.name))
-        if filename == summary_name then
+        local config = module.config.public.categories
+        local index_name = vim.fs.normalize(vim.fn.resolve(ws_root .. "/" .. config.name))
+        if filename == index_name then
             return true
         end
-        if config.per_category_summary then
-            local cats_dir = vim.fs.normalize(vim.fn.resolve(ws_root .. "/" .. config.categories_dir))
+        if config.per_subcategory_index then
+            local cats_dir = vim.fs.normalize(vim.fn.resolve(ws_root .. "/" .. config.dir))
             if vim.startswith(filename, cats_dir .. "/") then
                 return true
             end
@@ -344,11 +321,10 @@ module.private = {
         return false
     end,
 
-    --- Debounce auto-summary generation per workspace.
+    --- Debounce index generation per workspace.
     --- @param ws_name string
     --- @param filename string|nil normalized absolute file path to track
     debounce_workspace_update = function(ws_name, filename)
-        local config = module.config.public
         local timers = module.private.watch_timers
         local pending = module.private.pending_changes
         if filename then
@@ -365,7 +341,7 @@ module.private = {
         else
             timer:stop()
         end
-        timer:start(config.watch_debounce_ms, 0, function()
+        timer:start(module.private.watch_debounce_ms, 0, function()
             timer:stop()
             local changed = pending[ws_name]
             pending[ws_name] = nil
@@ -374,7 +350,7 @@ module.private = {
                 changed_list = vim.tbl_keys(changed)
             end
             vim.schedule(function()
-                module.public.auto_summary(ws_name, { changed_files = changed_list })
+                module.public.index(ws_name, { changed_files = changed_list })
             end)
         end)
     end,
@@ -393,7 +369,7 @@ module.private = {
                 if not module.private.workspace_watchers[name] then
                     local watcher = vim.uv.new_fs_event()
                     if watcher then
-                        watcher:start(ws_root, { recursive = true }, function(err, filename, _events)
+                        watcher:start(ws_root, { recursive = true }, function(err, filename, _)
                             if err then
                                 vim.schedule(function()
                                     utils.notify("Watcher error for " .. ws_root .. ": " .. err, vim.log.levels.ERROR)
@@ -517,32 +493,50 @@ module.private = {
         return scratch, true
     end,
 
-    --- Collect entries from norg files, grouped by category.
+    --- Normalize a metadata field into a list for an indexer.
+    --- Keeping this separate from category tree construction lets future
+    --- indexers reuse the same entry collection pipeline for other fields.
+    --- @param metadata table normalized document metadata
+    --- @param field string metadata field to index
+    --- @param fallback string[] values used when the field is absent
+    --- @return string[] values
+    normalize_metadata_values = function(metadata, field, fallback)
+        local values = metadata[field]
+        if not values or values == vim.NIL then
+            return vim.list_extend({}, fallback)
+        end
+        if type(values) ~= "table" then
+            return { tostring(values) }
+        end
+        return values
+    end,
+
+    --- Collect entries from norg files, grouped by metadata value.
     --- @param files string[] list of absolute file paths
     --- @param ws_norm string normalized workspace root
-    --- @param summary_path string absolute path of the main summary file to skip
-    --- @param cats_dir_abs string|nil absolute path of the categories directory to skip
+    --- @param index_path string absolute path of the main index file to skip
+    --- @param cats_dir_abs string|nil absolute path of the category index directory to skip
     --- @param changed_set table|nil map of normalized absolute file paths that changed
     --- @return table categorized map of full category string -> entries list
     --- @return string[] category_order ordered list of unique full category strings
     --- @return table affected_categories map of full category strings affected by changed files
-    collect_entries = function(files, ws_norm, summary_path, cats_dir_abs, changed_set)
+    collect_entries = function(files, ws_norm, index_path, cats_dir_abs, changed_set)
         local ts = module.required["core.integrations.treesitter"]
         local categorized = {}
         local category_order = {}
         local affected_categories = {}
-        local config = module.config.public
-        local separator = config.category_separator
+        local config = module.config.public.categories
+        local separator = config.subcategory_separator
 
         for _, file in ipairs(files) do
             local abs_path = vim.fs.normalize(tostring(file))
 
-            -- Skip the summary file
-            if abs_path == summary_path then
+            -- Skip the main index file
+            if abs_path == index_path then
                 goto continue
             end
 
-            -- Skip files inside the categories directory
+            -- Skip files inside the category index directory
             if cats_dir_abs and vim.startswith(abs_path, cats_dir_abs .. "/") then
                 goto continue
             end
@@ -573,7 +567,7 @@ module.private = {
             local created = (metadata.created ~= vim.NIL and metadata.created ~= "") and metadata.created or nil
             local updated = (metadata.updated ~= vim.NIL and metadata.updated ~= "") and metadata.updated or nil
 
-            -- Build normalized metadata for format_note_title callback
+            -- Build normalized metadata for the title_formatter callback
             local norm_meta = {}
             for k, v in pairs(metadata) do
                 if v ~= vim.NIL then
@@ -582,12 +576,7 @@ module.private = {
             end
             norm_meta.title = title -- ensure resolved title is available
 
-            local cats = metadata.categories
-            if not cats or cats == vim.NIL then
-                cats = { "Uncategorized" }
-            elseif type(cats) ~= "table" then
-                cats = { tostring(cats) }
-            end
+            local cats = module.private.normalize_metadata_values(metadata, "categories", { "Uncategorized" })
 
             if changed_set and changed_set[abs_path] then
                 for _, cat in ipairs(cats) do
@@ -735,13 +724,13 @@ module.private = {
         return module.private.get_category_rel_path(parts, nil)
     end,
 
-    --- Find categories whose summary files currently reference any of the given note norgnames.
+    --- Find categories whose index files currently reference any of the given note norgnames.
     --- @param ws_norm string
     --- @param cats_dir_abs string
     --- @param norgnames string[]
     --- @return table map of full category strings -> true
     find_categories_for_norgnames = function(ws_norm, cats_dir_abs, norgnames)
-        local config = module.config.public
+        local config = module.config.public.categories
         local results = {}
         if not cats_dir_abs or #norgnames == 0 then
             return results
@@ -749,7 +738,7 @@ module.private = {
         if vim.fn.isdirectory(cats_dir_abs) ~= 1 then
             return results
         end
-        local files = vim.fs.find(function(name, _path)
+        local files = vim.fs.find(function(name, _)
             return name:sub(-5) == ".norg"
         end, { path = cats_dir_abs, type = "file", limit = math.huge })
         for _, abs_path in ipairs(files) do
@@ -759,9 +748,9 @@ module.private = {
                     if content:find("{:$" .. norgname .. ":}", 1, true) then
                         local rel_path = abs_path:gsub("^" .. vim.pesc(ws_norm .. "/"), "")
                         local cat_path = rel_path
-                            :gsub("^" .. vim.pesc(config.categories_dir .. "/"), "")
+                            :gsub("^" .. vim.pesc(config.dir .. "/"), "")
                             :gsub("%.norg$", "")
-                        local full_cat = cat_path:gsub("/", config.category_separator)
+                        local full_cat = cat_path:gsub("/", config.subcategory_separator)
                         results[full_cat] = true
                         break
                     end
@@ -805,11 +794,11 @@ module.private = {
         return #node.child_order > 0
     end,
 
-    --- Get the relative file path (from workspace root) for a category node.
-    --- Always: <categories_dir>/<path...>/<category_name>.norg
-    get_category_rel_path = function(path_parts, _node)
-        local config = module.config.public
-        local parts = { config.categories_dir }
+    --- Get the relative file path (from workspace root) for a category index.
+    --- Always: <dir>/<path...>/<category_name>.norg
+    get_category_rel_path = function(path_parts, _)
+        local config = module.config.public.categories
+        local parts = { config.dir }
         for i = 1, #path_parts - 1 do
             table.insert(parts, path_parts[i])
         end
@@ -861,10 +850,10 @@ module.private = {
 
     --- Format a list of entries as heading link lines.
     format_entry_lines = function(entries, heading_level)
-        local config = module.config.public
+        local config = module.config.public.categories
         local lines = {}
         for _, entry in ipairs(entries) do
-            local display_title = config.format_note_title(entry.metadata)
+            local display_title = config.title_formatter(entry.metadata)
             local line = string.rep("*", heading_level) .. " {:$" .. entry.norgname .. ":}[" .. display_title .. "]"
             table.insert(lines, line)
         end
@@ -873,7 +862,7 @@ module.private = {
 
     --- Sort entries based on config (sort_by and sort_direction).
     sort_entries = function(entries)
-        local config = module.config.public
+        local config = module.config.public.categories
         local sort_by = config.sort_by
         local ascending = config.sort_direction == "ascending"
 
@@ -912,7 +901,7 @@ module.private = {
 
     --- Sort a list of strings alphabetically (case-insensitive), respecting sort_direction.
     sort_strings = function(list)
-        local ascending = module.config.public.sort_direction == "ascending"
+        local ascending = module.config.public.categories.sort_direction == "ascending"
         table.sort(list, function(a, b)
             if ascending then
                 return a:lower() < b:lower()
@@ -922,10 +911,10 @@ module.private = {
         end)
     end,
 
-    --- Generate main summary lines when per_category_summary is enabled.
-    --- Top-level categories become headings that link to their summary files.
-    generate_main_summary_with_files = function(tree)
-        local config = module.config.public
+    --- Generate main index lines when per_subcategory_index is enabled.
+    --- Top-level categories become headings that link to their category indexes.
+    generate_main_index_lines = function(tree)
+        local config = module.config.public.categories
         local heading_level = 1
         local result = { string.rep("*", heading_level) .. " Index", "" }
 
@@ -957,8 +946,8 @@ module.private = {
         return result
     end,
 
-    --- Generate tree lines for inline mode (per_category_summary is false).
-    --- Recursively generates the full category tree with notes listed under
+    --- Generate tree lines for inline mode (per_subcategory_index is false).
+    --- Recursively generate the full category tree with notes listed under
     --- their corresponding subcategory (not flattened). No "Notes" heading.
     generate_tree_lines = function(node, heading_level)
         local result = {}
@@ -983,13 +972,13 @@ module.private = {
         return result
     end,
 
-    --- Generate all category file contents.
+    --- Generate all category index contents.
     --- @param affected_categories table|nil map of full category strings to include
     --- @return table map of relative_path -> content_string
-    generate_all_category_files = function(tree, affected_categories)
-        local config = module.config.public
+    generate_all_category_index_files = function(tree, affected_categories)
+        local config = module.config.public.categories
         local files = {}
-        local separator = config.category_separator
+        local separator = config.subcategory_separator
 
         local function generate_node(node, node_name, path_parts)
             local full_cat = table.concat(path_parts, separator)
@@ -1182,7 +1171,29 @@ module.private = {
         return table.concat(body_lines, "\n", start_idx)
     end,
 
-    --- Generate fresh metadata lines for a summary file using the metagen API.
+    --- Return the configured core.esupports.metagen options.
+    --- The indexer follows the metagen module's type and update_date settings.
+    --- @return table metagen configuration
+    get_metagen_config = function()
+        local metagen = module.required["core.esupports.metagen"]
+        return metagen.config and metagen.config.public or {}
+    end,
+
+    --- Whether metadata should be created for an index file.
+    --- @param path string absolute path of the index file
+    --- @return boolean
+    should_generate_metadata = function(path)
+        local metadata_type = module.private.get_metagen_config().type
+        if metadata_type == "auto" then
+            return true
+        end
+        if metadata_type == "empty" then
+            return module.private.read_file_contents(path) == nil
+        end
+        return false
+    end,
+
+    --- Generate fresh metadata lines for an index file using the metagen API.
     --- @param title string the title for the metadata
     --- @return string[] metadata lines
     generate_metadata_lines = function(title)
@@ -1246,30 +1257,34 @@ module.private = {
         return result
     end,
 
-    --- Prepare file content with metadata handling.
-    --- For new files or files without metadata: generate fresh metadata.
-    --- For existing files with metadata and changed content: update the "updated" field.
-    --- For existing files with metadata and unchanged content: keep metadata as-is.
+    --- Prepare generated index content according to core.esupports.metagen.
+    --- Existing metadata is preserved; missing metadata is generated only when
+    --- metagen.type is "auto" or when it is "empty" and the file is new.
     --- @param path string absolute file path
     --- @param body string the body content (without metadata)
     --- @param title string the title for fresh metadata
-    --- @return string full file content with metadata
-    prepare_content_with_metadata = function(path, body, title)
+    --- @return string full file content
+    prepare_index_content = function(path, body, title)
         local old_metadata_lines = module.private.read_existing_metadata(path)
         local old_body = module.private.read_file_body(path)
+        local metagen_config = module.private.get_metagen_config()
 
-        local metadata_lines
-        if old_metadata_lines then
-            if old_body and vim.trim(old_body) == vim.trim(body) then
-                -- Content unchanged, keep old metadata as-is
-                metadata_lines = old_metadata_lines
-            else
-                -- Content changed, update the updated timestamp
-                metadata_lines = module.private.update_metadata_timestamp(old_metadata_lines)
+        if not old_metadata_lines then
+            if not module.private.should_generate_metadata(path) then
+                return body
             end
-        else
-            -- No existing metadata, generate fresh
-            metadata_lines = module.private.generate_metadata_lines(title)
+            local metadata_lines = module.private.generate_metadata_lines(title)
+            return table.concat(metadata_lines, "\n") .. "\n\n" .. body
+        end
+
+        local metadata_lines = old_metadata_lines
+        local content_changed = not old_body or vim.trim(old_body) ~= vim.trim(body)
+        if
+            content_changed
+            and metagen_config.type ~= "none"
+            and metagen_config.update_date ~= false
+        then
+            metadata_lines = module.private.update_metadata_timestamp(old_metadata_lines)
         end
 
         return table.concat(metadata_lines, "\n") .. "\n\n" .. body
@@ -1329,32 +1344,32 @@ module.private = {
 }
 
 module.on_event = function(event)
-    if event.type == "core.neorgcmd.events.auto-summary.summarize" then
+    if event.type == "core.neorgcmd.events.indexer.index" then
         vim.schedule(function()
-            module.public.auto_summary()
+            module.public.index()
         end)
         return
     end
 
     if event.type == "core.dirman.events.workspace_changed" then
-        local handled_summary_on_launch = false
-        if module.private.summary_on_launch_pending then
-            handled_summary_on_launch = module.private.trigger_summary_on_launch()
+        local handled_index_on_launch = false
+        if module.private.index_on_launch_pending then
+            handled_index_on_launch = module.private.trigger_index_on_launch()
         end
 
-        if module.config.public.update_on_change then
+        if module.config.public.categories.index_on_change then
             vim.schedule(function()
                 module.private.setup_workspace_watchers()
                 local new_ws = event.content and event.content.new
-                if new_ws and not handled_summary_on_launch then
-                    module.public.auto_summary(new_ws)
+                if new_ws and not handled_index_on_launch then
+                    module.public.index(new_ws)
                 end
             end)
         end
         return
     end
 
-    if module.config.public.update_on_change then
+    if module.config.public.categories.index_on_change then
         if event.type == "core.dirman.events.file_created" then
             vim.schedule(function()
                 local bufnr = event.content and event.content.buffer
@@ -1362,7 +1377,7 @@ module.on_event = function(event)
                     local filepath = vim.fs.normalize(vim.fs.abspath(vim.fn.resolve(vim.api.nvim_buf_get_name(bufnr))))
                     local ws_name = module.private.find_workspace_for_file(filepath)
                     if ws_name then
-                        module.public.auto_summary(ws_name)
+                        module.public.index(ws_name)
                     end
                 end
             end)
@@ -1372,7 +1387,7 @@ end
 
 module.events.subscribed = {
     ["core.neorgcmd"] = {
-        ["auto-summary.summarize"] = true,
+        ["indexer.index"] = true,
     },
     ["core.dirman"] = {
         ["workspace_changed"] = true,
