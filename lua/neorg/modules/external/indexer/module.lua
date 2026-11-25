@@ -28,6 +28,10 @@ module.load = function()
                 min_args = 0,
                 name = "indexer.index",
             },
+            ["indexer-search"] = {
+                args = 0,
+                name = "indexer.search",
+            },
         })
     end)
     if module.config.public.categories.index_on_launch then
@@ -41,6 +45,10 @@ module.load = function()
 end
 
 module.config.public = {
+    search = {
+        search_content = true,
+        include_generated = false,
+    },
     categories = {
         name = "index.norg",
         dir = "categories",
@@ -61,6 +69,25 @@ module.config.public = {
 
 ---@class external.indexer
 module.public = {
+    --- Search saved notes in the current workspace using Telescope.
+    --- @param opts table|nil Telescope picker options
+    search = function(opts)
+        local dirman = modules.get_module("core.dirman")
+        local workspace = dirman and dirman.get_current_workspace()
+        if not workspace then
+            utils.notify("Cannot search notes: no current Dirman workspace", vim.log.levels.ERROR)
+            return
+        end
+        local root = workspace[1] == "default" and vim.fn.getcwd() or tostring(workspace[2])
+        local config = module.config.public
+        return require("neorg.modules.external.indexer.search_picker").open(
+            vim.fs.normalize(vim.fs.abspath(root)),
+            config.search.search_content,
+            not config.search.include_generated and config.categories or nil,
+            opts
+        )
+    end,
+
     --- Generate the category index for a workspace.
     --- @param ws_name string|nil workspace name; defaults to the current workspace
     --- @param opts table|nil options: { changed_files = string[] }
@@ -1344,6 +1371,13 @@ module.private = {
 }
 
 module.on_event = function(event)
+    if event.type == "core.neorgcmd.events.indexer.search" then
+        vim.schedule(function()
+            module.public.search()
+        end)
+        return
+    end
+
     if event.type == "core.neorgcmd.events.indexer.index" then
         vim.schedule(function()
             module.public.index()
@@ -1388,6 +1422,7 @@ end
 module.events.subscribed = {
     ["core.neorgcmd"] = {
         ["indexer.index"] = true,
+        ["indexer.search"] = true,
     },
     ["core.dirman"] = {
         ["workspace_changed"] = true,
