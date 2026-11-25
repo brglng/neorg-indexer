@@ -1,12 +1,13 @@
 --[[
     file: module.lua
     title: Indexer Module for Neorg
-    description: Index Neorg documents by category
+    description: Index Neorg documents by category, author, and date
     author: neorg-indexer
 --]]
 
 local neorg = require("neorg.core")
 local modules, utils = neorg.modules, neorg.utils
+local indexers = require("neorg.modules.external.indexer.indexers")
 
 local module = modules.create("external.indexer")
 
@@ -22,6 +23,7 @@ module.setup = function()
 end
 
 module.load = function()
+    module.private.warn_deprecated_options()
     modules.await("core.neorgcmd", function(neorgcmd)
         neorgcmd.add_commands_from_table({
             ["indexer"] = {
@@ -34,37 +36,30 @@ module.load = function()
             },
         })
     end)
-    if module.config.public.categories.index_on_launch then
+    if module.config.public.index_on_launch then
         modules.await("core.dirman", function(dirman)
             module.private.trigger_index_on_launch(dirman)
         end)
     end
-    if module.config.public.categories.index_on_change then
+    if module.config.public.index_on_change then
         module.private.setup_workspace_watchers()
     end
 end
 
+local default_title_formatter = indexers.default_title_formatter
+
 module.config.public = {
+    name = "index.norg",
+    index_on_launch = false,
+    index_on_change = true,
     search = {
         search_content = true,
         include_generated = false,
     },
-    categories = {
-        name = "index.norg",
-        dir = "categories",
-        index_on_launch = false,
-        index_on_change = true,
-        subcategory_separator = "/",
-        per_subcategory_index = true,
-        list_subcategory_notes = false,
-        sort_by = "alphabetical",
-        sort_direction = "ascending",
-        ---@param meta table normalized metadata of the note
-        ---@return string formatted title
-        title_formatter = function(meta)
-            return meta.title
-        end,
-    },
+    categories = vim.deepcopy(indexers.defaults.categories),
+    authors = vim.deepcopy(indexers.defaults.authors),
+    created = vim.deepcopy(indexers.defaults.created),
+    updated = vim.deepcopy(indexers.defaults.updated),
 }
 
 ---@class external.indexer
@@ -79,16 +74,14 @@ module.public = {
             return
         end
         local root = workspace[1] == "default" and vim.fn.getcwd() or tostring(workspace[2])
-        local config = module.config.public
         return require("neorg.modules.external.indexer.search_picker").open(
             vim.fs.normalize(vim.fs.abspath(root)),
-            config.search.search_content,
-            not config.search.include_generated and config.categories or nil,
+            module.config.public,
             opts
         )
     end,
 
-    --- Generate the category index for a workspace.
+    --- Generate the indexes for a workspace.
     --- @param ws_name string|nil workspace name; defaults to the current workspace
     --- @param opts table|nil options: { changed_files = string[] }
     index = function(ws_name, opts)
@@ -117,170 +110,184 @@ module.public = {
             return
         end
 
-        local ws_norm = vim.fs.normalize(tostring(ws_root))
-        local config = module.config.public.categories
-        local index_path = vim.fs.normalize(vim.fs.abspath(vim.fn.resolve(ws_norm .. "/" .. config.name)))
+        -- Paths are built from the workspace root as dirman reports it, so notes that are symlinks
+        -- (or live in symlinked directories) keep their in-workspace names. The resolved root is
+        -- only used to match paths reported in resolved form.
+        local ws_norm = vim.fs.normalize(vim.fs.abspath(tostring(ws_root)))
+        local ws_real = module.private.real_path(ws_norm)
+        local index_rel = vim.fs.normalize(module.config.public.name)
+        local index_path = vim.fs.normalize(ws_norm .. "/" .. index_rel)
 
         opts = opts or {}
         local changed_set = nil
         if type(opts.changed_files) == "table" then
             changed_set = {}
             for _, path in ipairs(opts.changed_files) do
-                local normalized = vim.fs.normalize(vim.fs.abspath(vim.fn.resolve(path)))
+                local normalized = vim.fs.normalize(vim.fs.abspath(path))
                 changed_set[normalized] = true
+                changed_set[module.private.real_path(normalized)] = true
             end
             if not next(changed_set) then
                 changed_set = nil
             end
         end
 
-        local cats_dir_abs = nil
-        if config.per_subcategory_index then
-            cats_dir_abs = vim.fs.normalize(vim.fn.resolve(ws_norm .. "/" .. config.dir))
-        end
+        local active = module.private.get_active_indexers(ws_norm)
+        local generated_dirs = indexers.marked_dirs(module.config.public, ws_norm)
 
         -- Collect entries from all norg files
-        local categorized, category_order, affected_categories = module.private.collect_entries(
-            dirman.get_norg_files(ws_name) or {},
-            ws_norm,
-            index_path,
-            cats_dir_abs,
-            changed_set
+        local entries = module.private.collect_entries(
+            module.private.list_norg_files(ws_norm),
+            { ws_norm, ws_real },
+            index_rel,
+            generated_dirs
         )
 
-        if changed_set and config.per_subcategory_index and cats_dir_abs then
-            local changed_norgnames = {}
+        local changed_norgnames = {}
+        if changed_set then
+            local seen = {}
             for path in pairs(changed_set) do
-                if path ~= index_path
-                    and path:match("%.norg$")
-                    and not (cats_dir_abs and vim.startswith(path, cats_dir_abs .. "/")) then
-                    if vim.startswith(path, ws_norm .. "/") then
-                        local norgname = path:gsub("^" .. vim.pesc(ws_norm), ""):gsub("%.norg$", "")
+                local rel = module.private.get_relative_path(path, { ws_norm, ws_real })
+                if
+                    rel
+                    and rel:match("%.norg$")
+                    and not module.private.is_generated_path(rel, index_rel, generated_dirs)
+                then
+                    local norgname = module.private.get_norgname(rel)
+                    if not seen[norgname] then
+                        seen[norgname] = true
                         table.insert(changed_norgnames, norgname)
                     end
                 end
             end
-            if #changed_norgnames > 0 then
-                local old_categories =
-                    module.private.find_categories_for_norgnames(ws_norm, cats_dir_abs, changed_norgnames)
-                for cat in pairs(old_categories) do
-                    affected_categories[cat] = true
-                    local parts = vim.split(cat, config.subcategory_separator, { plain = true })
-                    parts = vim.tbl_filter(function(p)
-                        return p ~= ""
-                    end, parts)
-                    if #parts > 1 then
-                        local acc = {}
-                        for _, part in ipairs(parts) do
-                            table.insert(acc, part)
-                            affected_categories[table.concat(acc, config.subcategory_separator)] = true
-                        end
+        end
+
+        local sections = {}
+        local bucket_contents = {}
+        local written_paths = {}
+        local dirs_to_delete = {}
+        local partial_updates = {}
+        local marked_dirs = {}
+        for _, ix in ipairs(active) do
+            local tree = module.private.build_tree(ix, entries)
+            local state = ix.per_file and module.private.get_dir_state(ix.dir_abs) or nil
+            if state == "foreign" then
+                -- Never overwrite or delete files the indexer did not generate.
+                module.private.notify_once(
+                    "external.indexer: `"
+                        .. ix.def.key
+                        .. ".dir` ("
+                        .. ix.dir_abs
+                        .. ") exists, is not empty, and has no "
+                        .. indexers.marker
+                        .. " marker file; skipping the "
+                        .. ix.def.title
+                        .. " index",
+                    vim.log.levels.ERROR
+                )
+                goto continue
+            end
+            table.insert(sections, module.private.generate_section_lines(ix, tree, index_rel))
+
+            if ix.per_file then
+                -- Partial updates need an existing generated index directory to patch. Name collisions
+                -- shift the names of other buckets, so they always trigger a full rebuild.
+                local affected = nil
+                if
+                    changed_set
+                    and state == "marked"
+                    and not tree.has_collisions
+                    and not module.private.has_collision_suffix(ix.dir_abs)
+                then
+                    affected = module.private.find_affected_buckets(ix, entries, changed_set, changed_norgnames)
+                end
+
+                -- Prepare content with metadata handling (BEFORE deleting index directories)
+                local files = module.private.generate_bucket_files(ix, tree, affected, index_rel)
+                local rel_paths = vim.tbl_keys(files)
+                table.sort(rel_paths)
+                for _, rel_path in ipairs(rel_paths) do
+                    local body = files[rel_path]
+                    local abs_path = vim.fs.normalize(ws_norm .. "/" .. rel_path)
+                    local folded = indexers.fold_case(abs_path)
+                    -- Each path is written at most once per run.
+                    if not written_paths[folded] then
+                        written_paths[folded] = true
+                        local title = body:match("^%*+ ([^\n]+)") or vim.fn.fnamemodify(rel_path, ":t:r")
+                        bucket_contents[abs_path] =
+                            module.private.prepare_index_content(abs_path, body, module.private.unescape(title))
+                    end
+                end
+
+                if affected then
+                    table.insert(partial_updates, { ix = ix, tree = tree, affected = affected })
+                else
+                    if state == "marked" then
+                        table.insert(dirs_to_delete, ix.dir_abs)
+                    end
+                    if #rel_paths > 0 then
+                        table.insert(marked_dirs, ix.dir_abs)
                     end
                 end
             end
+            ::continue::
         end
 
-        local partial_update = changed_set ~= nil and next(affected_categories) ~= nil
+        local files_to_write = {}
 
-        -- Build category tree
-        local tree = module.private.build_category_tree(categorized, category_order, config.subcategory_separator)
-
-        local write_main = true
-        if config.per_subcategory_index and not config.list_subcategory_notes and partial_update then
-            write_main = module.private.top_level_categories_changed(cats_dir_abs, tree.child_order)
+        -- Main index: skip the write when nothing would change.
+        local main_lines = { "* Index" }
+        for _, section in ipairs(sections) do
+            table.insert(main_lines, "")
+            vim.list_extend(main_lines, section)
+        end
+        local main_body = table.concat(main_lines, "\n") .. "\n"
+        local main_content = module.private.prepare_index_content(index_path, main_body, "Index")
+        if main_content ~= module.private.read_file_contents(index_path) then
+            table.insert(files_to_write, { path = index_path, content = main_content })
         end
 
-        if config.per_subcategory_index then
-            -- Generate main index with links to category indexes
-            local main_lines
-            if write_main then
-                main_lines = module.private.generate_main_index_lines(tree)
+        -- Now safe to delete index directories for full rebuilds. Only directories that contain
+        -- the marker file are ever deleted.
+        for _, dir in ipairs(dirs_to_delete) do
+            if vim.fn.isdirectory(dir) == 1 and indexers.has_marker(dir) then
+                vim.fn.delete(dir, "rf")
             end
+        end
+        for _, update in ipairs(partial_updates) do
+            module.private.delete_obsolete_bucket_files(update.ix, update.tree, update.affected)
+        end
+        -- Mark generated directories before writing their files.
+        for _, dir in ipairs(marked_dirs) do
+            module.private.write_marker(dir)
+        end
 
-            -- Generate all category file contents (relative paths -> body content)
-            local category_files =
-                module.private.generate_all_category_index_files(tree, partial_update and affected_categories or nil)
+        -- Create directories and prepare file entries
+        local bucket_paths = vim.tbl_keys(bucket_contents)
+        table.sort(bucket_paths)
+        for _, abs_path in ipairs(bucket_paths) do
+            vim.fn.mkdir(vim.fn.fnamemodify(abs_path, ":h"), "p")
+            table.insert(files_to_write, { path = abs_path, content = bucket_contents[abs_path] })
+        end
 
-            local main_body
-            if write_main then
-                main_body = table.concat(main_lines, "\n") .. "\n"
-            end
-
-            -- Prepare content with metadata handling (BEFORE deleting categories dir)
-            local files_to_write = {}
-
-            -- Main index
-            if write_main then
-                local main_content = module.private.prepare_index_content(index_path, main_body, "Index")
-                table.insert(files_to_write, { path = index_path, content = main_content })
-            end
-
-            -- Category indexes (read old data BEFORE directory deletion)
-            local category_contents = {}
-            for rel_path, body in pairs(category_files) do
-                local abs_path = vim.fs.normalize(ws_norm .. "/" .. rel_path)
-                local category_title = body:match("^%*+ ([^\n]+)") or vim.fn.fnamemodify(rel_path, ":t:r")
-                category_contents[abs_path] = module.private.prepare_index_content(abs_path, body, category_title)
-            end
-
-            -- Now safe to delete categories directory for full rebuilds only
-            if not partial_update then
-                if cats_dir_abs and vim.fn.isdirectory(cats_dir_abs) == 1 then
-                    vim.fn.delete(cats_dir_abs, "rf")
-                end
-            elseif affected_categories and next(affected_categories) ~= nil then
-                module.private.delete_obsolete_category_files(ws_norm, tree, affected_categories, config.subcategory_separator)
-            end
-
-            -- Create directories and prepare file entries
-            for abs_path, content in pairs(category_contents) do
-                local dir = vim.fn.fnamemodify(abs_path, ":h")
-                vim.fn.mkdir(dir, "p")
-                table.insert(files_to_write, { path = abs_path, content = content })
-            end
-
-            -- Write all files, preferring buffer updates for open files
-            local disk_writes = {}
-            for _, file_info in ipairs(files_to_write) do
-                local bufnr = module.private.find_open_buffer(file_info.path)
-                if bufnr then
-                    module.private.write_to_buffer(bufnr, file_info.content)
-                else
-                    table.insert(disk_writes, file_info)
-                end
-            end
-            if #disk_writes > 0 then
-                module.private.write_files_async(disk_writes, function()
-                    vim.schedule(function()
-                        utils.notify("Index generated at " .. index_path)
-                    end)
-                end)
-            else
-                utils.notify("Index generated at " .. index_path)
-            end
-        else
-            -- Generate the main index with tree sub-headings
-            local main_lines = vim.list_extend({ "* Index", "\n" }, module.private.generate_tree_lines(tree, 2))
-            local main_body = table.concat(main_lines, "\n") .. "\n"
-
-            local content = module.private.prepare_index_content(index_path, main_body, "Index")
-
-            -- Write single file, preferring buffer update if open
-            local bufnr = module.private.find_open_buffer(index_path)
+        -- Write all files, preferring buffer updates for open files
+        local disk_writes = {}
+        for _, file_info in ipairs(files_to_write) do
+            local bufnr = module.private.find_open_buffer(file_info.path)
             if bufnr then
-                module.private.write_to_buffer(bufnr, content)
-                utils.notify("Index generated at " .. index_path)
+                module.private.write_to_buffer(bufnr, file_info.content)
             else
-                module.private.write_file_async(index_path, content, function(err)
-                    vim.schedule(function()
-                        if err then
-                            utils.notify("Failed to write index file: " .. err, vim.log.levels.ERROR)
-                        else
-                            utils.notify("Index generated at " .. index_path)
-                        end
-                    end)
-                end)
+                table.insert(disk_writes, file_info)
             end
+        end
+        if #disk_writes > 0 then
+            module.private.write_files_async(disk_writes, function()
+                vim.schedule(function()
+                    utils.notify("Index generated at " .. index_path)
+                end)
+            end)
+        else
+            utils.notify("Index generated at " .. index_path)
         end
     end,
 }
@@ -290,13 +297,48 @@ module.private = {
     watch_timers = {},
     pending_changes = {},
     index_on_launch_pending = false,
+    deprecation_warned = false,
+    notified = {},
     watch_debounce_ms = 200,
+
+    --- Warn once about options that moved from `categories` to the top level.
+    --- The old keys are not honored.
+    warn_deprecated_options = function()
+        if module.private.deprecation_warned then
+            return
+        end
+        local categories = module.config.public.categories
+        if type(categories) ~= "table" then
+            return
+        end
+        local messages = {}
+        for _, key in ipairs({ "name", "index_on_launch", "index_on_change" }) do
+            if categories[key] ~= nil then
+                table.insert(messages, "`categories." .. key .. "` is no longer supported; use `" .. key .. "` instead")
+            end
+        end
+        if #messages > 0 then
+            module.private.deprecation_warned = true
+            utils.notify("external.indexer: " .. table.concat(messages, "; "), vim.log.levels.WARN)
+        end
+    end,
+
+    --- Notify a message once per session.
+    --- @param message string
+    --- @param level integer vim.log.levels value
+    notify_once = function(message, level)
+        if module.private.notified[message] then
+            return
+        end
+        module.private.notified[message] = true
+        utils.notify(message, level)
+    end,
 
     --- Attempt to run index_on_launch once a real workspace is available.
     --- @param dirman table|nil
     --- @return boolean triggered true when an index was scheduled
     trigger_index_on_launch = function(dirman)
-        if not module.config.public.categories.index_on_launch then
+        if not module.config.public.index_on_launch then
             return false
         end
         dirman = dirman or module.required["core.dirman"]
@@ -322,30 +364,185 @@ module.private = {
         local dirman = module.required["core.dirman"]
         for _, name in ipairs(dirman.get_workspace_names()) do
             local root = vim.fs.normalize(tostring(dirman.get_workspace(name)))
-            if vim.startswith(filepath, root .. "/") then
+            if module.private.get_relative_path(filepath, { root, module.private.real_path(root) }) then
                 return name
             end
         end
         return nil
     end,
 
-    --- Determine whether a path should be ignored for watcher-triggered updates.
-    --- @param filename string normalized absolute file path
+    --- Normalize an absolute path with symlinks resolved.
+    --- A missing file is resolved through its parent directory. Uses only libuv so that it is
+    --- safe in libuv callbacks.
+    --- @param path string
+    --- @return string
+    real_path = function(path)
+        path = vim.fs.normalize(vim.fs.abspath(path))
+        local resolved = vim.uv.fs_realpath(path)
+        if resolved then
+            return vim.fs.normalize(resolved)
+        end
+        local parent = vim.uv.fs_realpath(vim.fs.dirname(path))
+        if parent then
+            return vim.fs.normalize(parent .. "/" .. vim.fs.basename(path))
+        end
+        return path
+    end,
+
+    --- List the .norg files of a workspace, following symlinks like `core.dirman` does.
+    --- Unlike `core.dirman.get_norg_files`, paths are not resolved: a symlinked note or directory
+    --- keeps its path inside the workspace.
+    --- @param ws_root string normalized absolute workspace root
+    --- @return string[] normalized absolute file paths
+    list_norg_files = function(ws_root)
+        local files = {}
+        -- Real paths of the directories on the current walk, to avoid symlink cycles.
+        local ancestors = {}
+        local function walk(dir, depth)
+            local real = vim.uv.fs_realpath(dir)
+            if not real or ancestors[real] or depth > 20 then
+                return
+            end
+            ancestors[real] = true
+            local handle = vim.uv.fs_scandir(dir)
+            while handle do
+                local name, kind = vim.uv.fs_scandir_next(handle)
+                if not name then
+                    break
+                end
+                local path = dir .. "/" .. name
+                if kind == "link" or kind == nil then
+                    local stat = vim.uv.fs_stat(path)
+                    kind = stat and stat.type
+                end
+                if kind == "directory" then
+                    walk(path, depth + 1)
+                elseif kind == "file" and name:sub(-5) == ".norg" then
+                    table.insert(files, path)
+                end
+            end
+            ancestors[real] = nil
+        end
+        walk(ws_root, 1)
+        table.sort(files)
+        return files
+    end,
+
+    --- Path relative to the first root that contains it.
+    --- @param path string normalized absolute path
+    --- @param roots string[] normalized absolute workspace roots (e.g. unresolved and resolved)
+    --- @return string|nil
+    get_relative_path = function(path, roots)
+        for _, root in ipairs(roots) do
+            if vim.startswith(path, root .. "/") then
+                return path:sub(#root + 2)
+            end
+        end
+        return nil
+    end,
+
+    --- Return the usable enabled indexers with their absolute index directories.
+    --- Indexers with an invalid `dir` are reported once and skipped.
     --- @param ws_root string normalized workspace root
+    --- @return table[] list of { def, config, dir, dir_abs, per_file, list_notes }
+    get_active_indexers = function(ws_root)
+        local active = {}
+        for _, ix in ipairs(indexers.configured(module.config.public)) do
+            if ix.enabled then
+                if ix.warning then
+                    module.private.notify_once("external.indexer: " .. ix.warning, vim.log.levels.WARN)
+                end
+                if ix.error then
+                    module.private.notify_once(
+                        "external.indexer: " .. ix.error .. "; skipping the " .. ix.def.title .. " index",
+                        vim.log.levels.ERROR
+                    )
+                else
+                    ix.dir_abs = vim.fs.normalize(ws_root .. "/" .. ix.dir)
+                    table.insert(active, ix)
+                end
+            end
+        end
+        return active
+    end,
+
+    --- State of an indexer directory.
+    --- @param dir_abs string absolute directory path
+    --- @return string "missing", "empty", "marked" (contains the marker file), or "foreign"
+    get_dir_state = function(dir_abs)
+        local stat = vim.uv.fs_stat(dir_abs)
+        if not stat then
+            return "missing"
+        end
+        if stat.type ~= "directory" then
+            return "foreign"
+        end
+        if indexers.has_marker(dir_abs) then
+            return "marked"
+        end
+        local handle = vim.uv.fs_scandir(dir_abs)
+        if handle and vim.uv.fs_scandir_next(handle) == nil then
+            return "empty"
+        end
+        return "foreign"
+    end,
+
+    --- Create an indexer directory and its marker file.
+    --- @param dir_abs string absolute directory path
+    write_marker = function(dir_abs)
+        vim.fn.mkdir(dir_abs, "p")
+        if not indexers.has_marker(dir_abs) then
+            vim.fn.writefile({
+                "This directory is generated by neorg-indexer.",
+                "It is deleted and regenerated on full rebuilds. Do not store notes here.",
+            }, dir_abs .. "/" .. indexers.marker)
+        end
+    end,
+
+    --- Whether an indexer directory contains a file with a collision suffix ("name~2.norg").
+    --- @param dir_abs string absolute directory path
     --- @return boolean
-    should_ignore_path = function(filename, ws_root)
-        local config = module.config.public.categories
-        local index_name = vim.fs.normalize(vim.fn.resolve(ws_root .. "/" .. config.name))
-        if filename == index_name then
+    has_collision_suffix = function(dir_abs)
+        local found = vim.fs.find(function(name)
+            return name:match("~%d+%.norg$") ~= nil
+        end, { path = dir_abs, type = "file", limit = 1 })
+        return #found > 0
+    end,
+
+    --- Whether a workspace-relative path is the main index file or inside a generated directory.
+    --- @param rel string normalized path relative to the workspace root
+    --- @param index_rel string normalized main index path relative to the workspace root
+    --- @param dirs string[] normalized generated directories relative to the workspace root
+    --- @return boolean
+    is_generated_path = function(rel, index_rel, dirs)
+        if rel == index_rel then
             return true
         end
-        if config.per_subcategory_index then
-            local cats_dir = vim.fs.normalize(vim.fn.resolve(ws_root .. "/" .. config.dir))
-            if vim.startswith(filename, cats_dir .. "/") then
+        for _, dir in ipairs(dirs) do
+            if rel == dir or vim.startswith(rel, dir .. "/") then
                 return true
             end
         end
         return false
+    end,
+
+    --- Determine whether a path should be ignored for watcher-triggered updates.
+    --- Called from libuv callbacks: uses only fast-safe functions.
+    --- @param filename string normalized absolute file path
+    --- @param ws_root string normalized workspace root
+    --- @return boolean
+    should_ignore_path = function(filename, ws_root)
+        local roots = { ws_root, module.private.real_path(ws_root) }
+        local rel = module.private.get_relative_path(filename, roots)
+            or module.private.get_relative_path(module.private.real_path(filename), roots)
+        if not rel then
+            return false
+        end
+        return module.private.is_generated_path(
+            rel,
+            vim.fs.normalize(module.config.public.name),
+            indexers.marked_dirs(module.config.public, ws_root)
+        )
     end,
 
     --- Debounce index generation per workspace.
@@ -520,51 +717,46 @@ module.private = {
         return scratch, true
     end,
 
-    --- Normalize a metadata field into a list for an indexer.
-    --- Keeping this separate from category tree construction lets future
-    --- indexers reuse the same entry collection pipeline for other fields.
-    --- @param metadata table normalized document metadata
-    --- @param field string metadata field to index
-    --- @param fallback string[] values used when the field is absent
-    --- @return string[] values
-    normalize_metadata_values = function(metadata, field, fallback)
-        local values = metadata[field]
-        if not values or values == vim.NIL then
-            return vim.list_extend({}, fallback)
-        end
-        if type(values) ~= "table" then
-            return { tostring(values) }
-        end
-        return values
+    --- Path relative to the workspace root, without .norg extension, used in links.
+    --- The leading "/" is intentional: combined with the "$" workspace anchor it
+    --- produces links of the form {:$/path/to/file:}[Title].
+    --- @param rel string normalized file path relative to the workspace root
+    --- @return string
+    get_norgname = function(rel)
+        return "/" .. rel:gsub("%.norg$", "")
     end,
 
-    --- Collect entries from norg files, grouped by metadata value.
+    --- Escape text for a Norg heading or link description.
+    --- @param text string
+    --- @return string
+    escape = function(text)
+        return (text:gsub("[\\%[%]]", "\\%0"))
+    end,
+
+    --- Remove Norg backslash escapes.
+    --- @param text string
+    --- @return string
+    unescape = function(text)
+        return (text:gsub("\\(.)", "%1"))
+    end,
+
+    --- Collect entries from norg files. Metadata is read once and shared by all indexers.
+    --- Paths are not resolved: a symlinked note is indexed under its path in the workspace.
     --- @param files string[] list of absolute file paths
-    --- @param ws_norm string normalized workspace root
-    --- @param index_path string absolute path of the main index file to skip
-    --- @param cats_dir_abs string|nil absolute path of the category index directory to skip
-    --- @param changed_set table|nil map of normalized absolute file paths that changed
-    --- @return table categorized map of full category string -> entries list
-    --- @return string[] category_order ordered list of unique full category strings
-    --- @return table affected_categories map of full category strings affected by changed files
-    collect_entries = function(files, ws_norm, index_path, cats_dir_abs, changed_set)
+    --- @param roots string[] normalized workspace roots (unresolved first, then resolved)
+    --- @param index_rel string main index path relative to the workspace root
+    --- @param skip_dirs string[] generated directories relative to the workspace root
+    --- @return table[] entries
+    collect_entries = function(files, roots, index_rel, skip_dirs)
         local ts = module.required["core.integrations.treesitter"]
-        local categorized = {}
-        local category_order = {}
-        local affected_categories = {}
-        local config = module.config.public.categories
-        local separator = config.subcategory_separator
+        local entries = {}
 
         for _, file in ipairs(files) do
-            local abs_path = vim.fs.normalize(tostring(file))
+            local abs_path = vim.fs.normalize(vim.fs.abspath(tostring(file)))
+            local rel = module.private.get_relative_path(abs_path, roots)
 
-            -- Skip the main index file
-            if abs_path == index_path then
-                goto continue
-            end
-
-            -- Skip files inside the category index directory
-            if cats_dir_abs and vim.startswith(abs_path, cats_dir_abs .. "/") then
+            -- Skip files outside the workspace, the main index file, and generated index directories
+            if not rel or module.private.is_generated_path(rel, index_rel, skip_dirs) then
                 goto continue
             end
 
@@ -579,11 +771,6 @@ module.private = {
             if created_scratch then
                 module.private.safe_buf_delete(bufnr)
             end
-
-            -- Path relative to workspace root, without .norg extension, used in links.
-            -- The leading "/" is intentional: combined with the "$" workspace anchor it
-            -- produces links of the form {:$/path/to/file:}[Title].
-            local norgname = abs_path:gsub("^" .. vim.pesc(ws_norm), ""):gsub("%.norg$", "")
 
             -- Fall back to filename when no title is present in metadata
             local title = (metadata.title ~= vim.NIL and metadata.title ~= "") and metadata.title
@@ -603,182 +790,170 @@ module.private = {
             end
             norm_meta.title = title -- ensure resolved title is available
 
-            local cats = module.private.normalize_metadata_values(metadata, "categories", { "Uncategorized" })
-
-            if changed_set and changed_set[abs_path] then
-                for _, cat in ipairs(cats) do
-                    affected_categories[cat] = true
-                    local parts = vim.split(cat, separator, { plain = true })
-                    parts = vim.tbl_filter(function(p)
-                        return p ~= ""
-                    end, parts)
-                    if #parts > 1 then
-                        local acc = {}
-                        for _, part in ipairs(parts) do
-                            table.insert(acc, part)
-                            affected_categories[table.concat(acc, separator)] = true
-                        end
-                    end
-                end
-            end
-
-            local entry = {
+            table.insert(entries, {
+                abs_path = abs_path,
                 title = title,
-                norgname = norgname,
+                norgname = module.private.get_norgname(rel),
                 description = description,
-                created = created,
-                updated = updated,
+                created = type(created) == "string" and created or nil,
+                updated = type(updated) == "string" and updated or nil,
                 metadata = norm_meta,
-            }
-
-            for _, cat in ipairs(cats) do
-                if not categorized[cat] then
-                    categorized[cat] = {}
-                    table.insert(category_order, cat)
-                end
-                table.insert(categorized[cat], entry)
-            end
+            })
 
             ::continue::
         end
 
-        if changed_set and not next(affected_categories) then
-            affected_categories = {}
-        end
-
-        return categorized, category_order, affected_categories
+        return entries
     end,
 
-    --- Build a category tree from flat categorized entries.
-    --- Each node has: children (map), child_order (list), entries (list).
-    --- @param categorized table map of full category string -> entries list
-    --- @param category_order string[] ordered list of full category strings
-    --- @param separator string the sub-category separator
-    --- @return table tree root node
-    build_category_tree = function(categorized, category_order, separator)
-        local tree = { children = {}, entries = {}, child_order = {} }
+    --- Return the bucket paths of an entry for an indexer, using the fallback bucket when empty.
+    --- @param ix table active indexer
+    --- @param entry table
+    --- @return string[][] bucket paths (lists of raw parts)
+    --- @return boolean is_fallback
+    get_bucket_paths = function(ix, entry)
+        local paths = ix.def.values(entry.metadata, ix.config)
+        if #paths > 0 then
+            return paths, false
+        end
+        local fallback = ix.config.fallback
+        if fallback == nil or fallback == false or fallback == "" then
+            return {}, false
+        end
+        return { { tostring(fallback) } }, true
+    end,
 
-        for _, full_cat in ipairs(category_order) do
-            local parts = vim.split(full_cat, separator, { plain = true })
-            -- Filter out empty parts from leading/trailing/double separators
-            parts = vim.tbl_filter(function(p)
-                return p ~= ""
-            end, parts)
-            if #parts == 0 then
-                parts = { full_cat }
-            end
+    --- Create an empty tree node.
+    new_node = function()
+        return { children = {}, entries = {}, child_order = {} }
+    end,
 
-            local node = tree
-            for _, part in ipairs(parts) do
-                if not node.children[part] then
-                    node.children[part] = { children = {}, entries = {}, child_order = {} }
-                    table.insert(node.child_order, part)
+    --- Assign a unique file name to every child of a node, recursively.
+    --- Names are encoded with indexers.encode_part. Siblings whose names differ only by case
+    --- would share a file on case-insensitive file systems: in sorted order of their raw names,
+    --- the first keeps its name and the others get "~2", "~3", ... suffixes.
+    --- @param node table
+    --- @param root table tree root, flagged with has_collisions when any suffix is used
+    assign_file_names = function(node, root)
+        local groups = {}
+        for _, name in ipairs(node.child_order) do
+            local encoded = indexers.encode_part(name)
+            local folded = vim.fn.tolower(encoded)
+            groups[folded] = groups[folded] or {}
+            table.insert(groups[folded], name)
+        end
+        for _, names in pairs(groups) do
+            table.sort(names)
+            for i, name in ipairs(names) do
+                local file_name = indexers.encode_part(name)
+                if i > 1 then
+                    file_name = file_name .. "~" .. i
+                    root.has_collisions = true
                 end
-                node = node.children[part]
+                node.children[name].file_name = file_name
             end
+        end
+        for _, name in ipairs(node.child_order) do
+            module.private.assign_file_names(node.children[name], root)
+        end
+    end,
 
-            for _, entry in ipairs(categorized[full_cat]) do
+    --- Build a bucket tree for an indexer and store it as `ix.tree`.
+    --- Each node has: children (map), child_order (list), entries (list), fallback (boolean),
+    --- and file_name (string, except for the root).
+    --- @param ix table active indexer
+    --- @param entries table[]
+    --- @return table tree root node
+    build_tree = function(ix, entries)
+        local tree = module.private.new_node()
+        for _, entry in ipairs(entries) do
+            local paths, is_fallback = module.private.get_bucket_paths(ix, entry)
+            for _, parts in ipairs(paths) do
+                local node = tree
+                for _, part in ipairs(parts) do
+                    if not node.children[part] then
+                        node.children[part] = module.private.new_node()
+                        table.insert(node.child_order, part)
+                    end
+                    node = node.children[part]
+                end
+                node.fallback = node.fallback or is_fallback
                 table.insert(node.entries, entry)
             end
         end
-
+        module.private.assign_file_names(tree, tree)
+        ix.tree = tree
         return tree
     end,
 
-    --- Check whether top-level categories have changed compared to existing category files.
-    --- @param cats_dir_abs string|nil
-    --- @param top_level string[]
-    --- @return boolean
-    top_level_categories_changed = function(cats_dir_abs, top_level)
-        if not cats_dir_abs or vim.fn.isdirectory(cats_dir_abs) ~= 1 then
-            return true
-        end
-        local existing = {}
-        for name, entry_type in vim.fs.dir(cats_dir_abs) do
-            if entry_type == "file" and name:sub(-5) == ".norg" then
-                table.insert(existing, name:sub(1, -6))
-            end
-        end
-        local desired = vim.list_extend({}, top_level)
-        module.private.sort_strings(existing)
-        module.private.sort_strings(desired)
-        if #existing ~= #desired then
-            return true
-        end
-        for i = 1, #existing do
-            if existing[i] ~= desired[i] then
-                return true
-            end
-        end
-        return false
-    end,
-
-    --- Check whether a full category exists in the tree.
-    --- @param tree table
-    --- @param full_cat string
-    --- @param separator string
-    --- @return boolean
-    category_exists = function(tree, full_cat, separator)
-        local parts = vim.split(full_cat, separator, { plain = true })
-        parts = vim.tbl_filter(function(p)
-            return p ~= ""
-        end, parts)
-        if #parts == 0 then
-            return false
-        end
-        local node = tree
-        for _, part in ipairs(parts) do
-            if not node.children[part] then
-                return false
-            end
-            node = node.children[part]
-        end
-        return true
-    end,
-
-    --- Convert a full category string to its relative category file path.
-    --- @param full_cat string
-    --- @param separator string
+    --- Key of a bucket: its file path relative to the indexer directory, without extension.
+    --- @param ix table active indexer, with the tree built by build_tree
+    --- @param path_parts string[] raw bucket path
     --- @return string
-    get_category_rel_path_from_string = function(full_cat, separator)
-        local parts = vim.split(full_cat, separator, { plain = true })
-        parts = vim.tbl_filter(function(p)
-            return p ~= ""
-        end, parts)
-        if #parts == 0 then
-            parts = { full_cat }
+    get_bucket_key = function(ix, path_parts)
+        local names = {}
+        local node = ix.tree
+        for _, part in ipairs(path_parts) do
+            node = node and node.children[part]
+            table.insert(names, node and node.file_name or indexers.encode_part(part))
         end
-        return module.private.get_category_rel_path(parts, nil)
+        return table.concat(names, "/")
     end,
 
-    --- Find categories whose index files currently reference any of the given note norgnames.
-    --- @param ws_norm string
-    --- @param cats_dir_abs string
-    --- @param norgnames string[]
-    --- @return table map of full category strings -> true
-    find_categories_for_norgnames = function(ws_norm, cats_dir_abs, norgnames)
-        local config = module.config.public.categories
-        local results = {}
-        if not cats_dir_abs or #norgnames == 0 then
-            return results
+    --- Get the relative file path (from workspace root) for a bucket index.
+    --- Always: <dir>/<path...>/<name>.norg
+    --- @param ix table active indexer
+    --- @param path_parts string[] raw bucket path
+    --- @return string
+    get_bucket_rel_path = function(ix, path_parts)
+        return ix.dir .. "/" .. module.private.get_bucket_key(ix, path_parts) .. ".norg"
+    end,
+
+    --- Display name of a bucket.
+    --- @param ix table active indexer
+    --- @param path_parts string[] raw bucket path
+    --- @return string
+    get_bucket_label = function(ix, path_parts)
+        return module.private.escape(ix.def.label(path_parts, ix.config))
+    end,
+
+    --- Collect the keys of all buckets in a tree.
+    --- @param ix table active indexer
+    --- @param tree table
+    --- @return table set of bucket keys
+    collect_bucket_keys = function(ix, tree)
+        local keys = {}
+        local function walk(node, path_parts)
+            for _, child_name in ipairs(node.child_order) do
+                local child_path_parts = vim.list_extend({}, path_parts)
+                table.insert(child_path_parts, child_name)
+                keys[module.private.get_bucket_key(ix, child_path_parts)] = true
+                walk(node.children[child_name], child_path_parts)
+            end
         end
-        if vim.fn.isdirectory(cats_dir_abs) ~= 1 then
+        walk(tree, {})
+        return keys
+    end,
+
+    --- Find buckets whose index files currently reference any of the given note norgnames.
+    --- @param ix table active indexer
+    --- @param norgnames string[]
+    --- @return table map of bucket keys -> true
+    find_buckets_for_norgnames = function(ix, norgnames)
+        local results = {}
+        if #norgnames == 0 or vim.fn.isdirectory(ix.dir_abs) ~= 1 then
             return results
         end
         local files = vim.fs.find(function(name, _)
             return name:sub(-5) == ".norg"
-        end, { path = cats_dir_abs, type = "file", limit = math.huge })
+        end, { path = ix.dir_abs, type = "file", limit = math.huge })
         for _, abs_path in ipairs(files) do
             local content = module.private.read_file_contents(abs_path)
             if content then
                 for _, norgname in ipairs(norgnames) do
                     if content:find("{:$" .. norgname .. ":}", 1, true) then
-                        local rel_path = abs_path:gsub("^" .. vim.pesc(ws_norm .. "/"), "")
-                        local cat_path = rel_path
-                            :gsub("^" .. vim.pesc(config.dir .. "/"), "")
-                            :gsub("%.norg$", "")
-                        local full_cat = cat_path:gsub("/", config.subcategory_separator)
-                        results[full_cat] = true
+                        local key = vim.fs.normalize(abs_path):sub(#ix.dir_abs + 2):gsub("%.norg$", "")
+                        results[key] = true
                         break
                     end
                 end
@@ -787,18 +962,63 @@ module.private = {
         return results
     end,
 
-    --- Delete category files that no longer exist in the tree.
-    --- @param ws_norm string
+    --- Find buckets affected by changed notes: their new and old buckets plus all ancestors.
+    --- @param ix table active indexer
+    --- @param entries table[]
+    --- @param changed_set table map of normalized absolute file paths that changed
+    --- @param changed_norgnames string[] norgnames of changed notes
+    --- @return table map of bucket keys -> true
+    find_affected_buckets = function(ix, entries, changed_set, changed_norgnames)
+        local affected = {}
+        for _, entry in ipairs(entries) do
+            if changed_set[entry.abs_path] or changed_set[module.private.real_path(entry.abs_path)] then
+                -- Keys of the bucket and its ancestors, from the raw parts: a part may contain
+                -- the subcategory separator or "/" and is not split again.
+                for _, parts in ipairs((module.private.get_bucket_paths(ix, entry))) do
+                    for i = 1, #parts do
+                        affected[module.private.get_bucket_key(ix, vim.list_slice(parts, 1, i))] = true
+                    end
+                end
+            end
+        end
+        -- Keys of existing files are file paths: encoded names never contain "/".
+        for key in pairs(module.private.find_buckets_for_norgnames(ix, changed_norgnames)) do
+            local acc = {}
+            for _, name in ipairs(vim.split(key, "/", { plain = true })) do
+                table.insert(acc, name)
+                affected[table.concat(acc, "/")] = true
+            end
+        end
+        return affected
+    end,
+
+    --- Delete bucket files that no longer exist in the tree, and directories left empty.
+    --- @param ix table active indexer
     --- @param tree table
-    --- @param affected_categories table map of full category strings
-    --- @param separator string
-    delete_obsolete_category_files = function(ws_norm, tree, affected_categories, separator)
-        for full_cat in pairs(affected_categories) do
-            if not module.private.category_exists(tree, full_cat, separator) then
-                local rel_path = module.private.get_category_rel_path_from_string(full_cat, separator)
-                local abs_path = vim.fs.normalize(ws_norm .. "/" .. rel_path)
-                if vim.fn.filereadable(abs_path) == 1 then
-                    vim.fn.delete(abs_path)
+    --- @param affected table map of bucket keys
+    delete_obsolete_bucket_files = function(ix, tree, affected)
+        if not indexers.has_marker(ix.dir_abs) then
+            return
+        end
+        -- Compare case-insensitively: on a case-insensitive file system, an obsolete key that
+        -- differs only by case from a valid one names the same, still valid, file.
+        local existing = {}
+        for key in pairs(module.private.collect_bucket_keys(ix, tree)) do
+            existing[indexers.fold_case(key)] = true
+        end
+        for key in pairs(affected) do
+            if not existing[indexers.fold_case(key)] then
+                local abs_path = ix.dir_abs .. "/" .. key
+                if vim.fn.filereadable(abs_path .. ".norg") == 1 then
+                    vim.fn.delete(abs_path .. ".norg")
+                end
+                -- Remove now-empty directories; fs_rmdir fails harmlessly on non-empty ones.
+                local dir = abs_path
+                while dir ~= ix.dir_abs and vim.startswith(dir, ix.dir_abs .. "/") do
+                    if vim.fn.isdirectory(dir) == 1 and not vim.uv.fs_rmdir(dir) then
+                        break
+                    end
+                    dir = vim.fn.fnamemodify(dir, ":h")
                 end
             end
         end
@@ -819,25 +1039,6 @@ module.private = {
     --- Check if a tree node has any children.
     has_children = function(node)
         return #node.child_order > 0
-    end,
-
-    --- Get the relative file path (from workspace root) for a category index.
-    --- Always: <dir>/<path...>/<category_name>.norg
-    get_category_rel_path = function(path_parts, _)
-        local config = module.config.public.categories
-        local parts = { config.dir }
-        for i = 1, #path_parts - 1 do
-            table.insert(parts, path_parts[i])
-        end
-        table.insert(parts, path_parts[#path_parts] .. ".norg")
-        return table.concat(parts, "/")
-    end,
-
-    --- Get the norgname (for links) of a category file.
-    --- Returns a path like /categories/a/b (without .norg).
-    get_category_norgname = function(path_parts, node)
-        local rel_path = module.private.get_category_rel_path(path_parts, node)
-        return "/" .. rel_path:gsub("%.norg$", "")
     end,
 
     --- Compute relative norgname from one file to another.
@@ -876,22 +1077,21 @@ module.private = {
     end,
 
     --- Format a list of entries as heading link lines.
-    format_entry_lines = function(entries, heading_level)
-        local config = module.config.public.categories
+    format_entry_lines = function(ix, entries, heading_level)
+        local title_formatter = ix.config.title_formatter or default_title_formatter
         local lines = {}
         for _, entry in ipairs(entries) do
-            local display_title = config.title_formatter(entry.metadata)
+            local display_title = module.private.escape(tostring(title_formatter(entry.metadata)))
             local line = string.rep("*", heading_level) .. " {:$" .. entry.norgname .. ":}[" .. display_title .. "]"
             table.insert(lines, line)
         end
         return lines
     end,
 
-    --- Sort entries based on config (sort_by and sort_direction).
-    sort_entries = function(entries)
-        local config = module.config.public.categories
-        local sort_by = config.sort_by
-        local ascending = config.sort_direction == "ascending"
+    --- Sort entries based on the indexer config (sort_by and sort_direction).
+    sort_entries = function(ix, entries)
+        local sort_by = ix.config.sort_by
+        local ascending = ix.config.sort_direction == "ascending"
 
         table.sort(entries, function(a, b)
             local va, vb
@@ -905,11 +1105,18 @@ module.private = {
                 va = a.title:lower()
                 vb = b.title:lower()
             end
-            if ascending then
-                return va < vb
-            else
+            if va ~= vb then
+                if ascending then
+                    return va < vb
+                end
                 return va > vb
             end
+            -- Deterministic tie-break: lowercased title, then norgname.
+            local ta, tb = a.title:lower(), b.title:lower()
+            if ta ~= tb then
+                return ta < tb
+            end
+            return a.norgname < b.norgname
         end)
     end,
 
@@ -926,108 +1133,131 @@ module.private = {
         return result
     end,
 
-    --- Sort a list of strings alphabetically (case-insensitive), respecting sort_direction.
-    sort_strings = function(list)
-        local ascending = module.config.public.categories.sort_direction == "ascending"
-        table.sort(list, function(a, b)
-            if ascending then
-                return a:lower() < b:lower()
-            else
-                return a:lower() > b:lower()
-            end
-        end)
+    --- Deduplicate and sort entries for display.
+    prepare_entries = function(ix, entries)
+        local result = module.private.deduplicate_entries(entries)
+        module.private.sort_entries(ix, result)
+        return result
     end,
 
-    --- Generate main index lines when per_subcategory_index is enabled.
-    --- Top-level categories become headings that link to their category indexes.
-    generate_main_index_lines = function(tree)
-        local config = module.config.public.categories
-        local heading_level = 1
-        local result = { string.rep("*", heading_level) .. " Index", "" }
+    --- Sort child bucket names alphabetically (case-insensitive), respecting sort_direction.
+    --- The fallback bucket always comes last.
+    --- @param ix table active indexer
+    --- @param node table
+    --- @return string[] sorted child names
+    sort_children = function(ix, node)
+        local names = vim.list_extend({}, node.child_order)
+        local ascending = ix.config.sort_direction == "ascending"
+        table.sort(names, function(a, b)
+            local fa, fb = node.children[a].fallback == true, node.children[b].fallback == true
+            if fa ~= fb then
+                return fb
+            end
+            local la, lb = a:lower(), b:lower()
+            if la == lb then
+                -- Deterministic order for names that differ only by case.
+                return a < b
+            end
+            if ascending then
+                return la < lb
+            end
+            return la > lb
+        end)
+        return names
+    end,
 
-        local child_heading_level = 2
-        local sorted_children = vim.list_extend({}, tree.child_order)
-        module.private.sort_strings(sorted_children)
+    --- Generate the lines of an indexer's section in the main index.
+    --- In per-file mode, top-level buckets become headings that link to their index files.
+    --- @param ix table active indexer
+    --- @param tree table
+    --- @param index_rel string main index path relative to the workspace root
+    --- @return string[]
+    generate_section_lines = function(ix, tree, index_rel)
+        local lines = { "** " .. ix.def.title }
+        if not ix.per_file then
+            vim.list_extend(lines, module.private.generate_tree_lines(ix, tree, {}, 3))
+            return lines
+        end
 
-        -- Category headings (no entry lines under them)
-        for _, child_name in ipairs(sorted_children) do
-            local child = tree.children[child_name]
-            local child_rel_path = module.private.get_category_rel_path({ child_name }, child)
-            local rel_norgname = module.private.get_relative_norgname(config.name, child_rel_path)
+        for _, child_name in ipairs(module.private.sort_children(ix, tree)) do
+            local rel_path = module.private.get_bucket_rel_path(ix, { child_name })
+            local rel_norgname = module.private.get_relative_norgname(index_rel, rel_path)
+            local label = module.private.get_bucket_label(ix, { child_name })
+            table.insert(lines, "*** {:" .. rel_norgname .. ":}[" .. label .. "]")
+        end
+
+        if ix.list_notes then
+            -- "Notes" heading with all descendant entries flattened
+            local all_entries = module.private.prepare_entries(ix, module.private.collect_all_entries(tree))
+            if #all_entries > 0 then
+                table.insert(lines, "*** Notes")
+                vim.list_extend(lines, module.private.format_entry_lines(ix, all_entries, 4))
+            end
+        end
+
+        return lines
+    end,
+
+    --- Generate tree lines for inline mode (per-file index disabled).
+    --- Recursively generate the full bucket tree with notes listed under
+    --- their corresponding bucket (not flattened). No "Notes" heading.
+    generate_tree_lines = function(ix, node, path_parts, heading_level)
+        local result = {}
+        for _, child_name in ipairs(module.private.sort_children(ix, node)) do
+            local child = node.children[child_name]
+            local child_path_parts = vim.list_extend({}, path_parts)
+            table.insert(child_path_parts, child_name)
+
+            -- Bucket heading
             table.insert(
                 result,
-                string.rep("*", child_heading_level) .. " {:" .. rel_norgname .. ":}[" .. child_name .. "]"
+                string.rep("*", heading_level) .. " " .. module.private.get_bucket_label(ix, child_path_parts)
             )
-        end
 
-        if config.list_subcategory_notes then
-            -- "Notes" heading with all descendant entries flattened
-            local all_entries = module.private.deduplicate_entries(module.private.collect_all_entries(tree))
-            module.private.sort_entries(all_entries)
-            if #all_entries > 0 then
-                vim.list_extend(result, { "", string.rep("*", heading_level) .. " Notes", "" })
-                vim.list_extend(result, module.private.format_entry_lines(all_entries, heading_level + 1))
-            end
-        end
+            -- Direct entries of this bucket
+            local entries = module.private.prepare_entries(ix, vim.list_extend({}, child.entries))
+            vim.list_extend(result, module.private.format_entry_lines(ix, entries, heading_level + 1))
 
-        return result
-    end,
-
-    --- Generate tree lines for inline mode (per_subcategory_index is false).
-    --- Recursively generate the full category tree with notes listed under
-    --- their corresponding subcategory (not flattened). No "Notes" heading.
-    generate_tree_lines = function(node, heading_level)
-        local result = {}
-        local sorted_children = vim.list_extend({}, node.child_order)
-        module.private.sort_strings(sorted_children)
-        for _, child_name in ipairs(sorted_children) do
-            local child = node.children[child_name]
-
-            -- Category heading
-            table.insert(result, string.rep("*", heading_level) .. " " .. child_name)
-
-            -- Direct entries of this category
-            local entries = module.private.deduplicate_entries(vim.list_extend({}, child.entries))
-            module.private.sort_entries(entries)
-            vim.list_extend(result, module.private.format_entry_lines(entries, heading_level + 1))
-
-            -- Recurse into subcategories
+            -- Recurse into sub-buckets
             if module.private.has_children(child) then
-                vim.list_extend(result, module.private.generate_tree_lines(child, heading_level + 1))
+                vim.list_extend(
+                    result,
+                    module.private.generate_tree_lines(ix, child, child_path_parts, heading_level + 1)
+                )
             end
         end
         return result
     end,
 
-    --- Generate all category index contents.
-    --- @param affected_categories table|nil map of full category strings to include
+    --- Generate all bucket index contents for an indexer.
+    --- @param ix table active indexer
+    --- @param tree table
+    --- @param affected table|nil map of bucket keys to include
+    --- @param index_rel string main index path relative to the workspace root
     --- @return table map of relative_path -> content_string
-    generate_all_category_index_files = function(tree, affected_categories)
-        local config = module.config.public.categories
+    generate_bucket_files = function(ix, tree, affected, index_rel)
         local files = {}
-        local separator = config.subcategory_separator
 
-        local function generate_node(node, node_name, path_parts)
-            local full_cat = table.concat(path_parts, separator)
-            local rel_path = module.private.get_category_rel_path(path_parts, node)
+        local function generate_node(node, path_parts)
+            local rel_path = module.private.get_bucket_rel_path(ix, path_parts)
             local heading_level = 1
             local child_heading_level = heading_level + 1
-            local lines = { string.rep("*", heading_level) .. " " .. node_name, "" }
+            local lines = {
+                string.rep("*", heading_level) .. " " .. module.private.get_bucket_label(ix, path_parts),
+                "",
+            }
 
             -- Compute parent link (relative)
             local parent_rel_path, parent_name
             if #path_parts == 1 then
-                -- Top-level category: parent is the main index file
-                parent_rel_path = config.name
-                parent_name = config.name:gsub("%.norg$", "")
+                -- Top-level bucket: parent is the main index file
+                parent_rel_path = index_rel
+                parent_name = module.private.escape((index_rel:gsub("%.norg$", "")))
             else
-                -- Sub-category: parent is the parent category file
-                local parent_path_parts = {}
-                for i = 1, #path_parts - 1 do
-                    table.insert(parent_path_parts, path_parts[i])
-                end
-                parent_rel_path = module.private.get_category_rel_path(parent_path_parts, nil)
-                parent_name = path_parts[#path_parts - 1]
+                -- Sub-bucket: parent is the parent bucket file
+                local parent_path_parts = vim.list_slice(path_parts, 1, #path_parts - 1)
+                parent_rel_path = module.private.get_bucket_rel_path(ix, parent_path_parts)
+                parent_name = module.private.get_bucket_label(ix, parent_path_parts)
             end
             local parent_rel_norgname = module.private.get_relative_norgname(rel_path, parent_rel_path)
             local parent_link_line = string.rep("*", child_heading_level)
@@ -1037,84 +1267,59 @@ module.private = {
                 .. parent_name
                 .. "]"
 
-            if module.private.has_children(node) then
-                local sorted_children = vim.list_extend({}, node.child_order)
-                module.private.sort_strings(sorted_children)
+            -- Headings linking to child files
+            local heading_lines = {}
+            for _, child_name in ipairs(module.private.sort_children(ix, node)) do
+                local child_path_parts = vim.list_extend({}, path_parts)
+                table.insert(child_path_parts, child_name)
+                local child_rel_path = module.private.get_bucket_rel_path(ix, child_path_parts)
+                local rel_norgname = module.private.get_relative_norgname(rel_path, child_rel_path)
+                table.insert(
+                    heading_lines,
+                    string.rep("*", child_heading_level)
+                        .. " {:"
+                        .. rel_norgname
+                        .. ":}["
+                        .. module.private.get_bucket_label(ix, child_path_parts)
+                        .. "]"
+                )
+            end
 
-                if config.list_subcategory_notes then
-                    -- Sub-category headings (no entries under them)
-                    for _, child_name in ipairs(sorted_children) do
-                        local child = node.children[child_name]
-                        local child_path_parts = vim.list_extend({}, path_parts)
-                        table.insert(child_path_parts, child_name)
-                        local child_rel_path = module.private.get_category_rel_path(child_path_parts, child)
-                        local rel_norgname = module.private.get_relative_norgname(rel_path, child_rel_path)
-                        table.insert(
-                            lines,
-                            string.rep("*", child_heading_level) .. " {:" .. rel_norgname .. ":}[" .. child_name .. "]"
-                        )
-                    end
-                    -- Parent link as last subcategory heading
-                    table.insert(lines, parent_link_line)
+            if module.private.has_children(node) and ix.list_notes then
+                -- Sub-bucket headings, then the parent link as the last heading
+                vim.list_extend(lines, heading_lines)
+                table.insert(lines, parent_link_line)
 
-                    -- "Notes" heading with all entries (direct + descendants) flattened
-                    local all_entries = module.private.deduplicate_entries(module.private.collect_all_entries(node))
-                    module.private.sort_entries(all_entries)
-                    if #all_entries > 0 then
-                        vim.list_extend(lines, { "", string.rep("*", heading_level) .. " Notes", "" })
-                        vim.list_extend(lines, module.private.format_entry_lines(all_entries, heading_level + 1))
-                    end
-                else
-                    -- Headings linking to child files
-                    local heading_lines = {}
-                    for _, child_name in ipairs(sorted_children) do
-                        local child = node.children[child_name]
-                        local child_path_parts = vim.list_extend({}, path_parts)
-                        table.insert(child_path_parts, child_name)
-                        local child_rel_path = module.private.get_category_rel_path(child_path_parts, child)
-                        local rel_norgname = module.private.get_relative_norgname(rel_path, child_rel_path)
-                        table.insert(
-                            heading_lines,
-                            string.rep("*", child_heading_level) .. " {:" .. rel_norgname .. ":}[" .. child_name .. "]"
-                        )
-                    end
-
-                    -- Only direct entries
-                    local entries = module.private.deduplicate_entries(vim.list_extend({}, node.entries))
-                    module.private.sort_entries(entries)
-                    local entry_lines = module.private.format_entry_lines(entries, heading_level + 1)
-
-                    vim.list_extend(lines, entry_lines)
-                    vim.list_extend(lines, heading_lines)
-                    -- Parent link as last heading
-                    table.insert(lines, parent_link_line)
+                -- "Notes" heading with all entries (direct + descendants) flattened
+                local all_entries = module.private.prepare_entries(ix, module.private.collect_all_entries(node))
+                if #all_entries > 0 then
+                    vim.list_extend(lines, { "", string.rep("*", heading_level) .. " Notes", "" })
+                    vim.list_extend(lines, module.private.format_entry_lines(ix, all_entries, heading_level + 1))
                 end
             else
-                -- Leaf node: list direct entries, sorted and deduplicated
-                local entries = module.private.deduplicate_entries(vim.list_extend({}, node.entries))
-                module.private.sort_entries(entries)
-                vim.list_extend(lines, module.private.format_entry_lines(entries, heading_level + 1))
-                -- Parent link as last item
+                -- Only direct entries, then child headings, then the parent link as the last heading
+                local entries = module.private.prepare_entries(ix, vim.list_extend({}, node.entries))
+                vim.list_extend(lines, module.private.format_entry_lines(ix, entries, heading_level + 1))
+                vim.list_extend(lines, heading_lines)
                 table.insert(lines, parent_link_line)
             end
 
             local content = table.concat(lines, "\n") .. "\n"
 
-            if not affected_categories or affected_categories[full_cat] then
+            if not affected or affected[module.private.get_bucket_key(ix, path_parts)] then
                 files[rel_path] = content
             end
 
             -- Recurse into children
             for _, child_name in ipairs(node.child_order) do
-                local child = node.children[child_name]
                 local child_path_parts = vim.list_extend({}, path_parts)
                 table.insert(child_path_parts, child_name)
-                generate_node(child, child_name, child_path_parts)
+                generate_node(node.children[child_name], child_path_parts)
             end
         end
 
         for _, child_name in ipairs(tree.child_order) do
-            generate_node(tree.children[child_name], child_name, { child_name })
+            generate_node(tree.children[child_name], { child_name })
         end
 
         return files
@@ -1391,7 +1596,7 @@ module.on_event = function(event)
             handled_index_on_launch = module.private.trigger_index_on_launch()
         end
 
-        if module.config.public.categories.index_on_change then
+        if module.config.public.index_on_change then
             vim.schedule(function()
                 module.private.setup_workspace_watchers()
                 local new_ws = event.content and event.content.new
@@ -1403,7 +1608,7 @@ module.on_event = function(event)
         return
     end
 
-    if module.config.public.categories.index_on_change then
+    if module.config.public.index_on_change then
         if event.type == "core.dirman.events.file_created" then
             vim.schedule(function()
                 local bufnr = event.content and event.content.buffer

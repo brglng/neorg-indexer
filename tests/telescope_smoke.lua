@@ -33,6 +33,23 @@ local function run()
     end
     write_target()
     vim.fn.writefile({ "old saved body" }, workspace .. "/match-c.norg")
+    -- Metadata filters read the generated indexes, not @document.meta.
+    vim.fn.writefile({ "@document.meta", "authors: [Grace Hopper]", "@end" }, workspace .. "/unindexed.norg")
+    vim.fn.mkdir(workspace .. "/index/authors", "p")
+    vim.fn.mkdir(workspace .. "/index/created/2025/04", "p")
+    vim.fn.writefile(
+        { "* Ada Lovelace", "", "** {:$/nested/match-b:}[match-b]" },
+        workspace .. "/index/authors/Ada Lovelace.norg"
+    )
+    vim.fn.writefile({ "* 2025", "", "** {:2025/04:}[2025-04]" }, workspace .. "/index/created/2025.norg")
+    vim.fn.writefile(
+        { "* 2025-04-01", "", "** {:$/nested/match-b:}[match-b]" },
+        workspace .. "/index/created/2025/04/01.norg"
+    )
+    -- Generated index directories contain the marker file.
+    for _, dir in ipairs({ "generated/cats", "index/authors", "index/created" }) do
+        vim.fn.writefile({}, workspace .. "/" .. dir .. "/.neorg-indexer")
+    end
     vim.fn.writefile({ "match outside workspace" }, root .. "/outside.norg")
     vim.cmd.cd(root)
 
@@ -43,11 +60,9 @@ local function run()
             ["core.integrations.treesitter"] = { config = { configure_parsers = false } },
             ["external.indexer"] = {
                 config = {
-                    categories = {
-                        index_on_change = false,
-                        name = "./generated/cats/../main.norg",
-                        dir = "generated//./cats/",
-                    },
+                    name = "./generated/cats/../main.norg",
+                    index_on_change = false,
+                    categories = { dir = "generated//./cats/" },
                     search = { search_content = false },
                 },
             },
@@ -129,6 +144,8 @@ local function run()
     await_rows("match", { { nil, "match-c.norg:match-c" }, { nil, b .. "match-b" } })
     await_rows("content:outside", {})
     await_rows("author:ada", { { nil, b .. "[authors: Ada Lovelace]:match-b" } })
+    await_rows("author:grace", {})
+    await_rows("status:draft", {})
     await_rows("content:indexmarker", {
         { 1, "generated/cats-extra/sub.norg:1:indexmarker" },
         { 1, "nested/main.norg:1:indexmarker" },

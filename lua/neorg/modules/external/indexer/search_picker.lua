@@ -150,7 +150,11 @@ local function previewer(config, opts)
     })
 end
 
-function M.open(root, search_content, categories, opts)
+--- Open the search picker.
+--- @param root string normalized workspace root
+--- @param index_config table external.indexer public configuration
+--- @param opts table|nil Telescope picker options
+function M.open(root, index_config, opts)
     local ok, pickers = pcall(require, "telescope.pickers")
     if not ok then
         vim.notify(
@@ -162,7 +166,13 @@ function M.open(root, search_content, categories, opts)
     local finders = require("telescope.finders")
     local sorters = require("telescope.sorters")
     local config = require("telescope.config").values
+    local search_index = require("neorg.modules.external.indexer.search_index")
     opts = opts or {}
+    local search_content = index_config.search.search_content
+    local excluded = not index_config.search.include_generated and search_index.generated_paths(index_config, root)
+        or nil
+    -- Metadata filters use the generated indexes, read once per picker.
+    local metadata = search_index.read(root, index_config)
 
     local snapshot = {}
     local picker = pickers.new(opts, {
@@ -205,12 +215,12 @@ function M.open(root, search_content, categories, opts)
         }),
     })
     picker:find()
-    notes.scan(root, categories, function()
+    notes.scan(root, excluded, function()
         return not picker.closed and vim.api.nvim_buf_is_valid(picker.prompt_bufnr)
     end, function(results)
         snapshot = results
         picker:refresh()
-    end)
+    end, metadata)
     return picker
 end
 

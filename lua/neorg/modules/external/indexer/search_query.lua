@@ -1,10 +1,16 @@
 local M = {}
 
-local aliases = {
-    author = { "author", "authors" },
-    authors = { "authors", "author" },
-    category = { "category", "categories" },
-    categories = { "categories", "category" },
+-- Supported fields. Metadata fields map to the canonical key of the index they
+-- are read from; any other `key:` makes the query invalid.
+local fields = {
+    title = "title",
+    content = "content",
+    author = "authors",
+    authors = "authors",
+    category = "categories",
+    categories = "categories",
+    created = "created",
+    updated = "updated",
 }
 
 local function normalize_date_separators(value)
@@ -32,7 +38,10 @@ function M.parse(prompt)
             local _, key_end, key = prompt:find("^([^%s:|\"]+):", i)
             if key then
                 i = key_end + 1
-                key = vim.fn.tolower(key)
+                key = fields[vim.fn.tolower(key)]
+                if not key then
+                    return nil
+                end
             end
 
             local value
@@ -133,12 +142,10 @@ local function match_term(note, term, search_content)
         end
         return #matches > 0 and matches or nil
     elseif field then
-        for _, key in ipairs(aliases[field] or { field }) do
-            for _, text in ipairs(note.metadata[key] or {}) do
-                local match = hit(text, term, "metadata", key)
-                if match then
-                    return { match }
-                end
+        for _, text in ipairs(note.metadata[field] or {}) do
+            local match = hit(text, term, "metadata", field)
+            if match then
+                return { match }
             end
         end
     end

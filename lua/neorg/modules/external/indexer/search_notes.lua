@@ -1,11 +1,18 @@
 local M = {}
 
+--- Create a searchable text object.
+--- @param value string
+--- @return table { value = string, lower = string|nil }
 local function text(value)
     -- ASCII can use the cheaper literal search. Keep the original for display and
     -- for byte-accurate case-insensitive matching of non-ASCII text.
     return { value = value, lower = not value:find("[\128-\255]") and value:lower() or nil }
 end
 
+M.text = text
+
+-- @document.meta is parsed only for the title and to keep it out of the body.
+-- Searchable metadata comes from the generated indexes (see search_index.lua).
 function M.parse(path, relative, source)
     local metadata, body = {}, {}
     local tag, containers, items
@@ -73,17 +80,22 @@ function M.parse(path, relative, source)
 
     local stem = relative:match("([^/]+)$"):sub(1, -6)
     local title = metadata.title and metadata.title[1] or text(stem)
-    return { path = path, relative = relative, title = title, body = body, metadata = metadata }
+    return { path = path, relative = relative, title = title, body = body, metadata = {} }
 end
 
 -- Yield between batches, including during traversal. Never follow directory or
 -- file symlinks: a search should not walk out of the chosen workspace.
-function M.scan(root, categories, active, done)
+-- `excluded` lists workspace-relative files and directories to skip (excluded
+-- directories are not traversed). `metadata` maps a note's relative path to its
+-- index-derived metadata.
+function M.scan(root, excluded, active, done, metadata)
     local notes = {}
-    -- Join before normalizing so dot segments in the config are workspace-relative.
-    local index_file = categories and vim.fs.normalize(root .. "/" .. categories.name)
-    local index_dir = categories and vim.fs.normalize(root .. "/" .. categories.dir)
-    local dirs = root == index_dir and {} or { { path = root, relative = "" } }
+    local skip = {}
+    for _, path in ipairs(excluded or {}) do
+        -- Join before normalizing so dot segments in the config are workspace-relative.
+        skip[vim.fs.normalize(root .. "/" .. path)] = true
+    end
+    local dirs = skip[vim.fs.normalize(root)] and {} or { { path = root, relative = "" } }
     local dir, handle
 
     local function step()
@@ -110,15 +122,17 @@ function M.scan(root, categories, active, done)
             else
                 local relative = dir.relative .. name
                 local path = vim.fs.joinpath(root, relative)
-                if kind == "directory" and path ~= index_dir then
+                if kind == "directory" and not skip[path] then
                     dirs[#dirs + 1] = { path = path, relative = relative .. "/" }
-                elseif kind == "file" and name:sub(-5) == ".norg" and path ~= index_file then
+                elseif kind == "file" and name:sub(-5) == ".norg" and not skip[path] then
                     local file = io.open(path, "rb")
                     if file then
                         local source = file:read("*a")
                         file:close()
                         if source then
-                            notes[#notes + 1] = M.parse(path, relative, source)
+                            local note = M.parse(path, relative, source)
+                            note.metadata = metadata and metadata[relative] or {}
+                            notes[#notes + 1] = note
                         end
                     end
                 end
