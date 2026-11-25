@@ -24,7 +24,7 @@ local function run()
         "Match first body",
         "ignored branch",
         "",
-        "  Next match body with full trailing text",
+        "  笔记 Next match body with full trailing text",
     }
     local function write_target()
         vim.fn.writefile(vim.tbl_map(function(line)
@@ -72,8 +72,27 @@ local function run()
 
     vim.opt.runtimepath:append(plugins .. "/plenary.nvim")
     vim.opt.runtimepath:append(plugins .. "/telescope.nvim")
+    local file_maker = require("telescope.previewers").buffer_previewer_maker
+    local delay_target, finish_preview
+    local target_reads = 0
     require("telescope").setup({
-        defaults = { initial_mode = "normal", layout_strategy = "vertical", layout_config = { preview_cutoff = 0 } },
+        defaults = {
+            initial_mode = "normal",
+            layout_strategy = "vertical",
+            layout_config = { preview_cutoff = 0 },
+            buffer_previewer_maker = function(path, buf, opts)
+                if delay_target and path == target then
+                    target_reads = target_reads + 1
+                    local callback = opts.callback
+                    opts.callback = function(preview_buf)
+                        finish_preview = function()
+                            callback(preview_buf)
+                        end
+                    end
+                end
+                file_maker(path, buf, opts)
+            end,
+        },
     })
     assert(dirman.set_workspace("notes"))
     vim.cmd("Neorg indexer-search")
@@ -128,7 +147,7 @@ local function run()
     lines[5] = "changed on disk"
     write_target()
     await_rows(
-        "title:match | author:ada authors:love date:2025-04-01 content:first content:next"
+        "title:match | author:ada authors:love date:2025-04-01 content:first content:next content:笔记"
             .. " | content:ignored missing | author:ada date:2025-04-01 content:body missing",
         {
             { nil, "match-c.norg:match-c" },
@@ -144,21 +163,53 @@ local function run()
         matched[row:sub(mark[3] + 1, mark[4].end_col)] = true
     end
     assert(
-        vim.deep_equal(matched, { match = true, Ada = true, Love = true, ["2025-04-01"] = true, first = true, Next = true }),
+        vim.deep_equal(matched, {
+            match = true, Ada = true, Love = true, ["2025-04-01"] = true, first = true, Next = true, ["笔记"] = true,
+        }),
         vim.inspect(matched)
     )
-    local preview = assert(picker.preview_win)
+    local preview_ns = assert(vim.api.nvim_get_namespaces()["neorg-indexer.search-preview"])
+    local function preview_marks(buf)
+        local matches, full_line, line_priority = {}, nil, nil
+        for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, preview_ns, 0, -1, { details = true })) do
+            local row, col, details = mark[2], mark[3], mark[4]
+            if details.line_hl_group then
+                assert(details.line_hl_group == "TelescopePreviewLine" and col == 0 and not full_line)
+                full_line, line_priority = row + 1, details.priority
+            else
+                assert(details.hl_group == "TelescopeMatching")
+                matches[#matches + 1] = { row + 1, col, details.end_col, details.priority }
+            end
+        end
+        for _, match in ipairs(matches) do
+            assert(line_priority and match[4] > line_priority)
+            match[4] = nil
+        end
+        return full_line, matches
+    end
+
+    local function await_preview(lnum, expected)
+        local win = assert(picker.preview_win)
+        assert(vim.wait(2000, function()
+            local buf = vim.api.nvim_win_get_buf(win)
+            local line, matches = preview_marks(buf)
+            return vim.api.nvim_buf_get_lines(buf, 7, 8, false)[1] == last
+                and line == lnum and vim.deep_equal(matches, expected)
+                and (not lnum or vim.deep_equal(vim.api.nvim_win_get_cursor(win), { lnum, 0 }))
+        end), "unexpected preview highlights or cursor for line " .. tostring(lnum))
+    end
+
+    local last_matches = { { 8, 2, 8 }, { 8, 9, 13 } } -- 笔记 takes six bytes.
     picker:set_selection(3)
-    assert(vim.wait(2000, function()
-        local buf = vim.api.nvim_win_get_buf(preview)
-        return vim.api.nvim_buf_get_lines(buf, 7, 8, false)[1] == last
-    end), "Telescope did not load the selected file preview")
-    -- The buffer is ready; exercise line navigation between rows of the same file.
+    await_preview(8, last_matches)
     picker:set_selection(2)
-    assert(vim.api.nvim_win_get_cursor(preview)[1] == 5)
-    picker:set_selection(3)
-    assert(state.get_selected_entry().lnum == 8 and vim.api.nvim_win_get_cursor(preview)[1] == 8,
-        "Telescope did not preview the selected body line")
+    await_preview(5, {}) -- Disk contents no longer match the indexed byte offsets.
+    picker:set_selection(1)
+    await_preview(nil, {})
+    await_rows("author:ada", { { nil, b .. "[authors: Ada Lovelace]:match-b" } })
+    await_preview(nil, {})
+    await_rows("content:next", { { 8, b .. "8:" .. last } })
+    await_preview(8, { { 8, 9, 13 } })
     actions.select_default(picker.prompt_bufnr)
     local opened = vim.api.nvim_buf_get_name(0)
     assert(opened ~= "" and vim.uv.fs_realpath(opened) == vim.uv.fs_realpath(target), opened)
@@ -181,14 +232,24 @@ local function run()
     await_rows("title:outside", { { nil, "outside.norg:outside" } })
     actions.close(picker.prompt_bufnr)
 
-    -- A body row should also jump on the initial load of a cold preview buffer.
+    -- With a cold, in-flight preview, switch to another row of the same file
+    -- before the maker completes. Only the current selection should be drawn.
     assert(dirman.set_workspace("notes"))
+    lines[5] = first
+    write_target()
+    delay_target = true
     picker = assert(indexer.search())
-    await_rows("content:next", { { 8, b .. "8:" .. last } })
-    local cold_preview = assert(picker.preview_win)
+    await_rows("content:first content:next content:笔记", { { 5, b .. "5:" .. first }, { 8, b .. "8:" .. last } })
     assert(vim.wait(2000, function()
-        return vim.api.nvim_win_get_cursor(cold_preview)[1] == 8
-    end), "Telescope did not jump on initial preview load")
+        return finish_preview ~= nil
+    end), "custom maker did not load the cold preview")
+    assert(state.get_selected_entry().lnum == 5)
+    picker:set_selection(1)
+    finish_preview()
+    await_preview(8, last_matches)
+    assert(target_reads == 1, "same-file selection started a duplicate preview read")
+    picker:set_selection(0)
+    await_preview(5, { { 5, 6, 11 } })
     actions.close(picker.prompt_bufnr)
 end
 

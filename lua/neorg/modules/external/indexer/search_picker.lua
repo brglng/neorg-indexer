@@ -48,6 +48,108 @@ local function display(entry)
     return oneline(row .. entry.result.text), highlights
 end
 
+local function previewer(config, opts)
+    if opts.previewer == false or opts.preview == false or (config.preview == false and not opts.preview) then
+        return false
+    end
+    local api = vim.api
+    local ns = api.nvim_create_namespace("neorg-indexer.search-preview")
+    opts.preview = vim.tbl_extend(
+        "force",
+        type(config.preview) == "table" and config.preview or {},
+        type(opts.preview) == "table" and opts.preview or {}
+    )
+
+    local function clear(state)
+        local buf = state.highlight_buf
+        if buf and api.nvim_buf_is_valid(buf) then
+            api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+        end
+        state.highlight_buf = nil
+    end
+
+    local function render(state, buf)
+        local selection = state.selection
+        if not selection or selection.buf ~= buf then
+            return
+        end
+        local win, entry = selection.win, selection.entry
+        if not api.nvim_win_is_valid(win) or api.nvim_win_get_buf(win) ~= buf or not entry.lnum then
+            return
+        end
+        local row = entry.lnum - 1
+        local line = api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
+        if not line then
+            return
+        end
+
+        state.highlight_buf = buf
+        api.nvim_buf_set_extmark(buf, ns, row, 0, { line_hl_group = "TelescopePreviewLine", priority = 200 })
+        -- The file may have changed since indexing, or the maker may transform it.
+        if line == entry.result.text then
+            local seen = {}
+            for _, hit in ipairs(entry.result.hits) do
+                if hit.kind == "content" then
+                    local key = hit.first .. ":" .. hit.last
+                    if not seen[key] then
+                        seen[key] = true
+                        api.nvim_buf_set_extmark(buf, ns, row, hit.first - 1, {
+                            end_col = hit.last,
+                            hl_group = "TelescopeMatching",
+                            priority = 201,
+                        })
+                    end
+                end
+            end
+        end
+        api.nvim_win_set_cursor(win, { entry.lnum, 0 })
+        api.nvim_win_call(win, function()
+            vim.cmd("normal! zz")
+        end)
+    end
+
+    return require("telescope.previewers").new_buffer_previewer({
+        title = "Grep Preview",
+        dyn_title = function(_, entry)
+            return entry.value.relative
+        end,
+        get_buffer_by_name = function(_, entry)
+            return entry.path
+        end,
+        setup = function()
+            return { ready = {} }
+        end,
+        teardown = function(self)
+            clear(self.state)
+            self.state.selection = nil
+            self.state.ready = {}
+        end,
+        define_preview = function(self, entry)
+            local state = self.state
+            local buf, win = state.bufnr, state.winid
+            clear(state)
+            state.selection = { buf = buf, win = win, entry = entry }
+            if state.ready[buf] then
+                render(state, buf)
+            elseif state.ready[buf] == nil then
+                -- Re-selecting a cached buffer must not bypass an in-flight read.
+                state.ready[buf] = false
+                config.buffer_previewer_maker(entry.path, buf, {
+                    winid = win,
+                    preview = opts.preview,
+                    file_encoding = opts.file_encoding,
+                    callback = vim.schedule_wrap(function()
+                        if state.ready[buf] == false then
+                            state.ready[buf] = true
+                            render(state, buf)
+                        end
+                    end),
+                })
+            end
+        end,
+    })
+end
+
 function M.open(root, search_content, categories, opts)
     local ok, pickers = pcall(require, "telescope.pickers")
     if not ok then
@@ -68,7 +170,7 @@ function M.open(root, search_content, categories, opts)
         prompt_title = "Search Neorg notes",
         results_title = "Workspace notes",
         sorting_strategy = "ascending",
-        previewer = opts.previewer ~= false and config.grep_previewer(opts) or false,
+        previewer = previewer(config, opts),
         finder = finders.new_dynamic({
             fn = function(prompt)
                 local groups = query.parse(prompt)
