@@ -73,7 +73,20 @@ draft: next steps | "quoted"; café; mixed É and [brackets].
     assert(match("month:2 month:2024-02 date:2024-02-29"))
     assert(not match("year:2025|month:2025-03"))
     assert(match("created:21:14 updated:2025-03"))
+    assert(not match("release -draft"))
+    assert(match("release -draft", false))
+    assert(not match("release -content:draft", false))
+    assert(not match([[release -"next steps"]]))
+    assert(not match([[-author:"Grace Hopper"]]))
+    assert(not match("-year:2024"))
+    rows, title = match("-year:2025 -status:archived")
+    assert(#rows == 1 and not title and rows[1].lnum == nil and #rows[1].hits == 0)
+    rows, title = match("release -draft | content:literal -category:archived")
+    assert(#rows == 1 and not title and rows[1].lnum == 22 and #rows[1].hits == 1)
+    local literal_dash = notes.parse("/workspace/dash.norg", "dash.norg", "-draft pre-release")
+    assert(query.match(literal_dash, query.parse([["-draft" pre-release]]), true))
     local invalid = {
+        "-", "release -", "- draft", "-title:", "-month:13",
         "", "title:", "title: release", "one|", "|one", "one||two",
         "\"unfinished", "\"\"", "\"foo\"bar", "date:2025-02-29", "month:13",
     }

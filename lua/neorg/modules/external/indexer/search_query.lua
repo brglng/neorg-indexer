@@ -47,6 +47,10 @@ function M.parse(prompt)
             groups[#groups + 1], group = group, {}
             i = i + 1
         else
+            local excluded = char == "-"
+            if excluded then
+                i = i + 1
+            end
             local _, key_end, key = prompt:find("^([^%s:|\"]+):", i)
             if key then
                 i = key_end + 1
@@ -82,7 +86,7 @@ function M.parse(prompt)
                 return nil
             end
 
-            local term = { field = key, value = value }
+            local term = { field = key, value = value, excluded = excluded }
             if key == "year" or key == "month" or key == "date" then
                 term.field, term.value, term.date_start = date_filter(key, value)
                 if not term.field then
@@ -148,6 +152,9 @@ local function match_term(note, term, search_content)
         for _, line in ipairs(note.body) do
             local match = hit(line, term, "content")
             if match then
+                if term.excluded then
+                    return { match }
+                end
                 matches[#matches + 1] = match
             end
         end
@@ -186,17 +193,18 @@ function M.match(note, groups, search_content)
         local satisfied = true
         for _, term in ipairs(group) do
             local matches = match_term(note, term, search_content)
-            if not matches then
+            if (matches ~= nil) == term.excluded then
                 satisfied = false
                 break
-            end
-            for _, match in ipairs(matches) do
-                if match.lnum then
-                    local hits = lines[match.lnum] or {}
-                    hits[#hits + 1] = match
-                    lines[match.lnum] = hits
-                else
-                    context[#context + 1] = match
+            elseif matches then
+                for _, match in ipairs(matches) do
+                    if match.lnum then
+                        local hits = lines[match.lnum] or {}
+                        hits[#hits + 1] = match
+                        lines[match.lnum] = hits
+                    else
+                        context[#context + 1] = match
+                    end
                 end
             end
         end

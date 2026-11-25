@@ -80,8 +80,10 @@ them. Reopen the picker to pick up changes on disk. Use Telescope's usual open
 and split mappings.
 
 Search uses case-insensitive literal substrings. Spaces are AND; `|` is OR and
-binds less tightly. Use double quotes for phrases or literal pipes, and `\"`
-(with a backslash) for a literal quote inside a phrase. Empty or incomplete
+binds less tightly. Prefix a term or filter with `-` (no space) to exclude
+notes that match it from that OR branch. A query with only exclusions returns
+notes that pass them. Use double quotes for phrases, literal pipes, or a literal
+leading `-`, and `\"` for a literal quote inside a phrase. Empty or incomplete
 queries show no results. Plain terms match titles or body text outside
 `@document.meta`, preferring the title when both match; notes without a title use
 the filename stem. AND terms can match on different lines of the same note.
@@ -96,6 +98,8 @@ with ties ordered by workspace-relative path and body lines in file order.
 |-------|---------|
 | `roadmap draft \| title:"release plan"` | Both plain terms, or the title phrase. |
 | `title:roadmap content:"next steps"` | The title and the body respectively. |
+| `roadmap -draft -category:archive` | Notes matching `roadmap` but not `draft` or the `archive` category. |
+| `-content:"work in progress"` | Notes without the phrase in their body, even if unqualified terms are configured to search titles only. |
 | `author:"Ada Lovelace" category:research` | The `author`/`authors` and `category`/`categories` metadata fields. |
 | `status:active project:"New Website"` | Arbitrary scalar metadata or individual list items. |
 | `year:2025 month:03` or `month:2025-03` | Notes **created** in March 2025. |
