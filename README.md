@@ -102,9 +102,11 @@ with ties ordered by workspace-relative path and body lines in file order.
 | `-content:"work in progress"` | Notes without the phrase in their body, even if unqualified terms are configured to search titles only. |
 | `author:"Ada Lovelace" category:research` | The `author`/`authors` and `category`/`categories` metadata fields. |
 | `status:active project:"New Website"` | Arbitrary scalar metadata or individual list items. |
-| `year:2025 month:03` or `month:2025-03` | Notes **created** in March 2025. |
-| `date:2025-03-15` | Notes **created** on that date. Calendar filters use the date as written, without time zone conversion. |
-| `created:2025-03 updated:2025-04` | Literal substrings in each timestamp field. |
+| `created:2025-03 updated:2025/04` | Notes created in March 2025 and updated in April 2025. |
+| `created:2025/03/15` | Notes with `2025-03-15` or `2025/03/15` in their `created` timestamp. |
+
+`created:` and `updated:` search the stored timestamp as a substring, without
+time zone conversion. Use either `-` or `/` between date components.
 
 To open the picker from Lua, optionally without a preview:
 

@@ -147,8 +147,8 @@ local function run()
     lines[5] = "changed on disk"
     write_target()
     await_rows(
-        "title:match | author:ada authors:love date:2025-04-01 content:first content:next content:笔记"
-            .. " | content:ignored missing | author:ada date:2025-04-01 content:body missing",
+        "title:match | author:ada authors:love created:2025/04/01 content:first content:next content:笔记"
+            .. " | content:ignored missing | author:ada created:2025-04-01 content:body missing",
         {
             { nil, "match-c.norg:match-c" },
             { nil, b .. "match-b" },

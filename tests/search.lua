@@ -35,13 +35,13 @@ draft: next steps | "quoted"; café; mixed É and [brackets].
         return query.match(note, assert(query.parse(prompt), prompt), implicit ~= false)
     end
 
-    local rows, title = match([[title:"Release Plan" content:"next steps" year:2024 content:literal]])
+    local rows, title = match([[title:"Release Plan" content:"next steps" created:2024/02/29 content:literal]])
     assert(title and #rows == 2)
     assert(rows[1].lnum == 22 and rows[1].text == "literal markup example")
     assert(rows[2].lnum == 24 and rows[2].text == [[draft: next steps | "quoted"; café; mixed É and [brackets].]])
     local hits = rows[2].hits
     assert(hits[1].text:sub(hits[1].first, hits[1].last) == "Release Plan")
-    assert(hits[2].label == "created" and hits[2].text:sub(hits[2].first, hits[2].last) == "2024")
+    assert(hits[2].label == "created" and hits[2].text:sub(hits[2].first, hits[2].last) == "2024-02-29")
     assert(hits[3].text:sub(hits[3].first, hits[3].last) == "next steps")
     rows = match("content:literal missing | release | content:draft | content:steps")
     assert(#rows == 2 and rows[1].lnum == nil and rows[2].lnum == 24)
@@ -70,25 +70,34 @@ draft: next steps | "quoted"; café; mixed É and [brackets].
     assert(not match("draft", false))
     assert(match("content:draft", false))
     assert(match("release", false))
-    assert(match("month:2 month:2024-02 date:2024-02-29"))
-    assert(not match("year:2025|month:2025-03"))
+    assert(match("created:2024 created:2024/02 updated:2025/03/01"))
     assert(match("created:21:14 updated:2025-03"))
+    assert(not match("created:2025|updated:2025/04"))
+    assert(not match("year:2024|month:02|date:2024-02-29"))
+    assert(match("category:dev/research"))
+    assert(not match("category:dev-research"))
+    local slash_date = notes.parse("/workspace/slash.norg", "slash.norg", table.concat({
+        "@document.meta", "updated: 2025/03/01", "@end",
+    }, "\n"))
+    local slash_rows = query.match(slash_date, query.parse("updated:2025-03-01"), true)
+    local slash_hit = slash_rows[1].hits[1]
+    assert(slash_hit.text:sub(slash_hit.first, slash_hit.last) == "2025/03/01")
     assert(not match("release -draft"))
     assert(match("release -draft", false))
     assert(not match("release -content:draft", false))
     assert(not match([[release -"next steps"]]))
     assert(not match([[-author:"Grace Hopper"]]))
-    assert(not match("-year:2024"))
-    rows, title = match("-year:2025 -status:archived")
+    assert(not match("-created:2024/02"))
+    rows, title = match("-created:2025 -status:archived")
     assert(#rows == 1 and not title and rows[1].lnum == nil and #rows[1].hits == 0)
     rows, title = match("release -draft | content:literal -category:archived")
     assert(#rows == 1 and not title and rows[1].lnum == 22 and #rows[1].hits == 1)
     local literal_dash = notes.parse("/workspace/dash.norg", "dash.norg", "-draft pre-release")
     assert(query.match(literal_dash, query.parse([["-draft" pre-release]]), true))
     local invalid = {
-        "-", "release -", "- draft", "-title:", "-month:13",
+        "-", "release -", "- draft", "-title:", "-updated:",
         "", "title:", "title: release", "one|", "|one", "one||two",
-        "\"unfinished", "\"\"", "\"foo\"bar", "date:2025-02-29", "month:13",
+        "\"unfinished", "\"\"", "\"foo\"bar", "created:",
     }
     for _, prompt in ipairs(invalid) do
         assert(not query.parse(prompt), prompt)

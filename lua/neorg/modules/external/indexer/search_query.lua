@@ -7,30 +7,8 @@ local aliases = {
     categories = { "categories", "category" },
 }
 
-local function valid_date(value)
-    local year, month, day = value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
-    if not year then
-        return false
-    end
-    year, month, day = tonumber(year), tonumber(month), tonumber(day)
-    local leap = year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0)
-    local days = { 31, leap and 29 or 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
-    return days[month] and day >= 1 and day <= days[month]
-end
-
-local function date_filter(field, value)
-    if field == "year" and value:match("^%d%d%d%d$") then
-        return "created", value, 1
-    elseif field == "month" then
-        local year, month = value:match("^(%d%d%d%d)%-(%d%d)$")
-        if year and valid_date(value .. "-01") then
-            return "created", value, 1
-        elseif not month and value:match("^%d%d?$") and tonumber(value) >= 1 and tonumber(value) <= 12 then
-            return "created", string.format("%02d", tonumber(value)), 6
-        end
-    elseif field == "date" and valid_date(value) then
-        return "created", value, 1
-    end
+local function normalize_date_separators(value)
+    return (value:gsub("(%d)/%f[%d]", "%1-"))
 end
 
 function M.parse(prompt)
@@ -86,16 +64,17 @@ function M.parse(prompt)
                 return nil
             end
 
-            local term = { field = key, value = value, excluded = excluded }
-            if key == "year" or key == "month" or key == "date" then
-                term.field, term.value, term.date_start = date_filter(key, value)
-                if not term.field then
-                    return nil
-                end
-            else
-                term.lower = value:lower()
+            local timestamp = key == "created" or key == "updated"
+            if timestamp then
+                value = normalize_date_separators(value)
             end
-            group[#group + 1] = term
+            group[#group + 1] = {
+                field = key,
+                value = value,
+                lower = value:lower(),
+                excluded = excluded,
+                timestamp = timestamp,
+            }
         end
     end
     if #group == 0 then
@@ -106,17 +85,10 @@ function M.parse(prompt)
 end
 
 local function find(text, term)
-    if term.date_start then
-        local date, suffix = text.value:match("^(%d%d%d%d%-%d%d%-%d%d)(.*)$")
-        if date and valid_date(date) and (suffix == "" or suffix:match("^[Tt ]%d%d:%d%d")) then
-            local first = term.date_start
-            local last = first + #term.value - 1
-            if date:sub(first, last) == term.value then
-                return first, last
-            end
-        end
-    elseif text.lower then
-        return text.lower:find(term.lower, 1, true)
+    -- Normalization preserves byte offsets into the original metadata value.
+    if text.lower then
+        local lower = term.timestamp and normalize_date_separators(text.lower) or text.lower
+        return lower:find(term.lower, 1, true)
     else
         if term.regex == nil then
             local ok, regex = pcall(vim.regex, "\\c\\V" .. term.value:gsub("\\", "\\\\"))
@@ -125,7 +97,8 @@ local function find(text, term)
         if not term.regex then
             return
         end
-        local first, last = term.regex:match_str(text.value)
+        local value = term.timestamp and normalize_date_separators(text.value) or text.value
+        local first, last = term.regex:match_str(value)
         if first then
             return first + 1, last
         end
