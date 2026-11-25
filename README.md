@@ -1,6 +1,6 @@
 # neorg-indexer
 
-Automatic category index generation for Neorg.
+Automatic category index generation and optional Telescope note search for Neorg.
 
 ## Installation
 
@@ -19,6 +19,10 @@ Add the following to your Neorg plugin configuration:
             ["core.defaults"] = {},
             ["external.indexer"] = {
                 config = {
+                    search = {
+                        search_content = true,
+                        include_generated = false,
+                    },
                     categories = {
                         name = "index.norg",
                         dir = "categories",
@@ -54,9 +58,72 @@ The `core.esupports.metagen` configuration controls metadata generated for index
 
 Run `:Neorg indexer` to generate the index for the current workspace.
 
+### Live note search
+
+Install `nvim-telescope/telescope.nvim` and its dependency `nvim-lua/plenary.nvim`
+for search. For example, add this spec to your lazy.nvim plugins:
+
+```lua
+{
+    "nvim-telescope/telescope.nvim",
+    dependencies = { "nvim-lua/plenary.nvim" },
+    lazy = true,
+}
+```
+
+Run `:Neorg indexer-search` and type in the picker. Search reads saved `.norg`
+files recursively in the current Dirman workspace (the current working directory
+for the `default` workspace). It ignores unsaved edits and symlinks, and does not
+use the category index, a database, or an external grep tool. Generated category
+indexes are excluded by default; see [Search options](#search-options) to include
+them. Reopen the picker to pick up changes on disk. Use Telescope's usual open
+and split mappings.
+
+Search uses case-insensitive literal substrings. Spaces are AND; `|` is OR and
+binds less tightly. Use double quotes for phrases or literal pipes, and `\"`
+(with a backslash) for a literal quote inside a phrase. Empty or incomplete
+queries show no results. Plain terms match titles or body text outside
+`@document.meta`, preferring the title when both match; notes without a title use
+the filename stem. AND terms can match on different lines of the same note.
+Each matching body line from a successful group gets one result, shown as
+`path/to/file.norg:42:full line text`. Previewing or opening that result jumps to
+line 42. Groups that match without the body get a `path/to/file.norg:title` result
+with no line number. Matched metadata appears after the path, for example
+`notes/a.norg:[authors: Ada]:42:line text`. Notes with title matches rank first,
+with ties ordered by workspace-relative path and body lines in file order.
+
+| Query | Matches |
+|-------|---------|
+| `roadmap draft \| title:"release plan"` | Both plain terms, or the title phrase. |
+| `title:roadmap content:"next steps"` | The title and the body respectively. |
+| `author:"Ada Lovelace" category:research` | The `author`/`authors` and `category`/`categories` metadata fields. |
+| `status:active project:"New Website"` | Arbitrary scalar metadata or individual list items. |
+| `year:2025 month:03` or `month:2025-03` | Notes **created** in March 2025. |
+| `date:2025-03-15` | Notes **created** on that date. Calendar filters use the date as written, without time zone conversion. |
+| `created:2025-03 updated:2025-04` | Literal substrings in each timestamp field. |
+
+To open the picker from Lua, optionally without a preview:
+
+```lua
+require("neorg.core").modules.get_module("external.indexer").search({ previewer = false })
+```
+
 ## Configuration
 
-All current indexing options are grouped under `config.categories`, leaving room for future indexers based on other metadata fields.
+Set these options under `load["external.indexer"].config` in your Neorg setup.
+
+### Search options
+
+Set these options in `config.search`:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `search_content` | boolean | `true` | Let unqualified terms match the note body as well as the title. Set to `false` for title-only unqualified terms. Explicit `content:` queries always search the body. |
+| `include_generated` | boolean | `false` | Also search the file at `config.categories.name` and `.norg` files under `config.categories.dir`. Both paths are relative to the workspace. |
+
+### Category index options
+
+Set these options in `config.categories`:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
