@@ -120,9 +120,14 @@ local function previewer(config, opts)
             return { ready = {} }
         end,
         teardown = function(self)
-            clear(self.state)
-            self.state.selection = nil
-            self.state.ready = {}
+            -- Telescope may tear down a previewer that was never set up.
+            local state = self.state
+            if not state then
+                return
+            end
+            clear(state)
+            state.selection = nil
+            state.ready = {}
         end,
         define_preview = function(self, entry)
             local state = self.state
