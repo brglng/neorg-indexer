@@ -1,6 +1,7 @@
 # neorg-indexer
 
-Automatic category index generation and optional Telescope note search for Neorg.
+Automatic category index generation and optional Telescope note search for Neorg,
+with BibTeX literatures indexed alongside notes.
 
 ## Installation
 
@@ -25,11 +26,15 @@ Add the following to your Neorg plugin configuration:
                     search = {
                         search_content = true,
                         include_generated = false,
+                        mappings = {
+                            open_pdf = "<C-o>",
+                        },
                     },
                     categories = {
                         enabled = true,
                         dir = "index/categories",
                         fallback = "Uncategorized",
+                        literature_fallback = "Literatures",
                         subcategory_separator = "/",
                         per_subcategory_index = true,
                         list_subcategory_notes = false,
@@ -64,12 +69,55 @@ Add the following to your Neorg plugin configuration:
                         sort_by = "updated",
                         sort_direction = "descending",
                     },
+                    -- `bibtex = false` disables all BibTeX field indexers.
+                    bibtex = {
+                        keyword = {
+                            enabled = true,
+                            dir = "index/bibtex/keyword",
+                            fallback = "Unknown",
+                            per_value_index = true,
+                            sort_by = "alphabetical",
+                            sort_direction = "ascending",
+                        },
+                        -- Same options as `keyword`, with `dir = "index/bibtex/<field>"`
+                        -- and `fallback = false`:
+                        booktitle = {},
+                        institution = {},
+                        journal = {},
+                        key = {},
+                        organization = {},
+                        publisher = {},
+                        school = {},
+                        type = {},
+                        language = {},
+                        journaltitle = {},
+                        location = {},
+                        pubstate = {},
+                        -- A date hierarchy like `created`:
+                        eventdate = {
+                            dir = "index/bibtex/eventdate",
+                            fallback = false,
+                            granularity = "day",
+                            per_period_index = true,
+                            list_subperiod_notes = false,
+                            sort_by = "alphabetical",
+                            sort_direction = "descending",
+                        },
+                    },
                 },
             },
         },
     },
 }
 ```
+
+The plugin ships a rockspec (`neorg-indexer-scm-1.rockspec`) that depends on
+`tree-sitter-bibtex`. lazy.nvim with luarocks support (its default `rocks`
+settings, using hererocks when needed) installs the BibTeX parser automatically,
+the same way Neorg gets `tree-sitter-norg`. Without lazy.nvim's rocks support,
+install the parser with `:TSInstall bibtex` from nvim-treesitter. The parser is
+only needed for [literatures](#literatures); without it, `.bib` files are skipped
+with one error message and notes still work.
 
 The `core.esupports.metagen` configuration controls metadata generated for index files. For example:
 
@@ -84,7 +132,9 @@ The `core.esupports.metagen` configuration controls metadata generated for index
 ## Usage
 
 Run `:Neorg indexer` to generate the indexes for the current workspace. The
-main index (`index.norg` by default) has one section per enabled indexer:
+main index (`index.norg` by default) has one section per enabled indexer that
+has buckets. The sections of the [BibTeX field indexers](#bibtex-field-indexers)
+are grouped as level-3 headings under one `** BibTeX` heading:
 
 ```norg
 * Index
@@ -92,6 +142,7 @@ main index (`index.norg` by default) has one section per enabled indexer:
 ** Categories
 *** {:index/categories/a:}[a]
 *** {:index/categories/f:}[f]
+*** {:index/categories/Literatures:}[Literatures]
 
 ** Authors
 *** {:index/authors/Ada Lovelace:}[Ada Lovelace]
@@ -101,7 +152,120 @@ main index (`index.norg` by default) has one section per enabled indexer:
 
 ** Updated
 *** {:index/updated/2025:}[2025]
+
+** BibTeX
+
+*** Keywords
+**** {:index/bibtex/keyword/Lossless:}[Lossless]
+
+*** Journals
+**** {:index/bibtex/journal/IEEE Transactions on Audio, Speech, and Language Processing:}[IEEE Transactions on Audio, Speech, and Language Processing]
+
+*** Publishers
+**** {:index/bibtex/publisher/Institute of Electrical and Electronics Engineers (IEEE):}[Institute of Electrical and Electronics Engineers (IEEE)]
 ```
+
+The `BibTeX` group comes after `Updated`, with its sections in this order:
+Keywords, Book Titles, Institutions, Journals, Keys, Organizations, Publishers,
+Schools, Types, Languages, Journal Titles, Locations, Event Dates, and
+Publication States. A section whose index has no buckets (such as `Schools`
+above) is not listed, for any indexer; it appears again once its index gets a
+bucket. The `** BibTeX` heading is listed only while one of its sections is (it
+is absent when the workspace has no literatures). If no index has buckets, the
+main index only keeps its `* Index` heading. The per-value index files under
+`index/bibtex/<field>/` are standalone: their top heading is the bucket value.
+
+### Literatures
+
+Each `.bib` file in the workspace is a literature, indexed and searched together
+with the notes. The same files are considered as for notes: the whole workspace
+including symlinks, but not the main index or generated index directories.
+
+Keep one BibTeX entry per file and name the file after the citekey, for example
+`literature/schlecht2017lossless.bib`. Only the first regular entry of a file is
+used (`@comment`, `@preamble`, and `@string` are not entries); if a file has more
+entries, a warning is logged and the rest are ignored. Files without an entry
+are skipped. `@string` macros of the same file, month macros (`jan`..`dec`), `#`
+concatenation, and common LaTeX accents (such as `{\"e}` → `ë`) are expanded,
+and field names are case-insensitive.
+
+The entry is projected onto the metadata used for notes:
+
+| BibTeX field | Metadata | Notes |
+|--------------|----------|-------|
+| `title` | `title` | Falls back to the citekey. |
+| `author` (else `editor`) | `authors` | Split on ` and ` outside braces; `Last, First` becomes `First Last`; `others` is dropped. |
+| `abstract` | `description` | |
+| `date`, else `year` and `month` | `created` and `updated` | For example `2017-03-15`, or `2017-03` from `year = 2017, month = mar`. |
+| `file` | (none) | The [PDF](#pdf) of the literature. |
+
+Literatures have no categories: they are in the categories `literature_fallback`
+bucket (`Literatures` by default, see [Categories](#categories)).
+
+These raw fields are indexed by their own [BibTeX field indexers](#bibtex-field-indexers)
+and searched with the listed filters:
+
+| BibTeX field | Indexer | Filters |
+|--------------|---------|---------|
+| `keywords` | `bibtex.keyword` | `keyword:`, `keywords:`, `bibtex_keyword:` |
+| `booktitle` | `bibtex.booktitle` | `booktitle:`, `bibtex_booktitle:` |
+| `institution` | `bibtex.institution` | `institution:`, `bibtex_institution:` |
+| `journal` | `bibtex.journal` | `journal:`, `bibtex_journal:` |
+| `key` (not the citekey) | `bibtex.key` | `bibtex_key:` |
+| `organization` | `bibtex.organization` | `organization:`, `bibtex_organization:` |
+| `publisher` | `bibtex.publisher` | `publisher:`, `bibtex_publisher:` |
+| `school` | `bibtex.school` | `school:`, `bibtex_school:` |
+| `type` (not the entry type) | `bibtex.type` | `bibtex_type:` |
+| `language` | `bibtex.language` | `language:`, `bibtex_language:` |
+| `journaltitle` | `bibtex.journaltitle` | `journaltitle:`, `bibtex_journaltitle:` |
+| `location` | `bibtex.location` | `location:`, `bibtex_location:` |
+| `eventdate` | `bibtex.eventdate` | `eventdate:`, `bibtex_eventdate:` |
+| `pubstate` | `bibtex.pubstate` | `pubstate:`, `bibtex_pubstate:` |
+
+All other fields, such as `address`, `annote`, `chapter`, `crossref`, `edition`,
+`howpublished`, `note`, `number`, `pages`, `series`, `volume`, `doi`, `url`,
+`urldate`, `isbn`, `issn`, `eprint`, `archiveprefix`/`eprinttype`,
+`primaryclass`/`eprintclass`, `subtitle`, and `addendum`, are kept raw only. All
+fields (including the projected and indexed ones), the entry type, and the
+citekey are kept in the metadata (`meta.citekey`, `meta.kind = "literature"`, and
+`meta.bibtex = { type = ..., key = ..., fields = { ... } }`, with lowercase field
+names), so a `title_formatter` can use them, but only the indexed ones are
+searchable by metadata.
+
+#### PDF
+
+The PDF of a literature comes only from the `file` field of its entry; a PDF
+next to the `.bib` file is not used otherwise. Supported values:
+
+- a plain path, such as `file = {schlecht2017lossless.pdf}`;
+- several files separated by `;`, of which the first with a `.pdf` extension
+  (any case) that exists is used;
+- JabRef/Zotero items `Description:path:Type`, such as
+  `file = {:papers/x.pdf:PDF;Slides:x.pptx:PowerPoint}`. JabRef escapes (`\:`,
+  `\;`, `\\`) are unescaped, and a Windows drive letter (`C:\papers\x.pdf`) is
+  kept as part of the path on a best-effort basis.
+
+Paths may be absolute, start with `~`, or be relative to the directory of the
+`.bib` file. A literature without a `file` field, or whose files do not exist,
+has no PDF.
+
+In index files a literature has the same heading level as a note, and links to
+its `.bib` file and PDF:
+
+```norg
+** {/ ../../literature/schlecht2017lossless.bib}[\[schlecht2017lossless\] On Lossless Feedback Delay Networks] {/ ../../literature/schlecht2017lossless.pdf}[\[PDF\]]
+```
+
+The description starts with `[citekey]`, and the `[PDF]` link is only present
+when a PDF is found. Their brackets, and `[`, `]`, and `\` in citekeys and titles,
+are escaped with `\` so that they are displayed literally. Neorg resolves relative `{/ path}` links from the directory
+of the file that contains them and does not expand `$/` in file links, so the
+paths are relative to the index file.
+
+With `index_on_change`, changes to `.bib` files update the indexes (including the
+BibTeX field indexes) like changes to notes, and adding, removing, or renaming a
+PDF updates the literatures whose `file` field names it, adding or removing their
+`[PDF]` link.
 
 ### Live note search
 
@@ -140,6 +304,17 @@ with no line number. Matched metadata appears after the path, for example
 `notes/a.norg:[authors: Ada]:42:line text`. Notes with title matches rank first,
 with ties ordered by workspace-relative path and body lines in file order.
 
+Literatures appear among the notes. Their title is `[citekey] title`, so plain
+terms and `title:` match the citekey too, and their body is the text of the `.bib`
+file, for example `literature/x.bib:12:  keywords = {Lossless},`. Metadata
+filters match literatures through the generated indexes. Opening a literature
+opens its `.bib` file (at the matched line). Press `<C-o>` (insert and normal
+mode, see `search.mappings.open_pdf`) to open the PDF of the selected literature
+with the system default application (`vim.ui.open`); it warns when the
+literature has no PDF. The action is also
+available as `require("neorg.modules.external.indexer.search_picker").actions.open_pdf`
+for custom Telescope mappings.
+
 | Query | Matches |
 |-------|---------|
 | `roadmap draft \| title:"release plan"` | Both plain terms, or the title phrase. |
@@ -147,17 +322,23 @@ with ties ordered by workspace-relative path and body lines in file order.
 | `roadmap -draft -category:archive` | Notes matching `roadmap` but not `draft` or the `archive` category. |
 | `-content:"work in progress"` | Notes without the phrase in their body, even if unqualified terms are configured to search titles only. |
 | `author:"Ada Lovelace" category:research` | The `author`/`authors` and `category`/`categories` indexes. |
+| `keyword:lossless -keywords:draft` | The BibTeX keyword index (`keyword`, `keywords`, or `bibtex_keyword`). |
+| `journal:"signal processing" bibtex_type:phdthesis` | The BibTeX journal and type indexes; see [Literatures](#literatures) for all BibTeX filters. |
+| `eventdate:2020-05` | Literatures whose event (or event range) starts in May 2020. |
 | `created:2025-03 updated:2025/04` | Notes created in March 2025 and updated in April 2025. |
 | `created:2025-03-15` | Notes created on 2025-03-15. |
 
-Metadata filters (`category:`, `author:`, `created:`, `updated:`) match the
-generated indexes, not the notes' `@document.meta`. Run `:Neorg indexer` first,
+Metadata filters (`category:`, `author:`, `created:`, `updated:`, and the
+[BibTeX filters](#literatures)) match the generated indexes, not the notes' `@document.meta`. Run `:Neorg indexer` first,
 or keep `index_on_change` enabled, so the indexes are current. A filter for a
 disabled indexer, or in a workspace without indexes (such as `default`), matches
 nothing. Other `key:` filters, such as `status:`, are not supported and make the
-query invalid.
+query invalid. The BibTeX `type` and `key` fields have no short filters (`type:`
+and `key:` are invalid); use `bibtex_type:` and `bibtex_key:`. Matched metadata of a
+literature is labeled with the filter name, for example `[journal: …]`,
+`[keywords: …]`, or `[bibtex_type: …]`.
 
-`created:` and `updated:` match a substring of the indexed date bucket, such as
+`created:`, `updated:`, and `eventdate:` match a substring of the indexed date bucket, such as
 `2025-03-15`. Use either `-` or `/` between date components. Time of day is not
 indexed and cannot be searched. With a coarser `granularity`, only coarser
 queries match: with `granularity = "month"`, `created:2025-03` matches but
@@ -180,7 +361,7 @@ Set these options under `load["external.indexer"].config` in your Neorg setup.
 |--------|------|---------|-------------|
 | `name` | string | `"index.norg"` | Name of the main index file, relative to the workspace root. |
 | `index_on_launch` | boolean | `false` | When `true`, generate indexes when the module is loaded. |
-| `index_on_change` | boolean | `true` | When `true`, regenerate indexes when workspace `.norg` files change. |
+| `index_on_change` | boolean | `true` | When `true`, regenerate indexes when workspace `.norg` or `.bib` files (or the PDFs of literatures) change. |
 
 `categories.name`, `categories.index_on_launch`, and `categories.index_on_change`
 were moved to the top level. The old keys are ignored with a warning.
@@ -193,12 +374,14 @@ Set these options in `config.search`:
 |--------|------|---------|-------------|
 | `search_content` | boolean | `true` | Let unqualified terms match the note body as well as the title. Set to `false` for title-only unqualified terms. Explicit `content:` queries always search the body. |
 | `include_generated` | boolean | `false` | Also search the main index file (`config.name`) and `.norg` files under each indexer's `dir` that holds generated files (see [Index directories](#index-directories)). All paths are relative to the workspace. |
+| `mappings.open_pdf` | string, table, or `false` | `"<C-o>"` | Picker key that opens the PDF of the selected literature. A string maps the key in insert and normal mode; a table such as `{ i = "<C-o>", n = "gp" }` maps each mode separately (modes without a key are not mapped); `false` disables the mapping. |
 
 ### Indexer options
 
 Each indexer is configured in its own table: `config.categories`,
-`config.authors`, `config.created`, and `config.updated`. These options are
-shared by all indexers. Every indexer is enabled when its table is omitted
+`config.authors`, `config.created`, `config.updated`, and the
+[BibTeX field indexers](#bibtex-field-indexers) in `config.bibtex` (such as
+`config.bibtex.journal`). These options are shared by all indexers. Every indexer is enabled when its table is omitted
 from the configuration. Set the table to `false` (e.g. `authors = false`) or
 set `enabled = false` in it to disable the indexer. Omitted options take their
 defaults.
@@ -206,10 +389,10 @@ defaults.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | boolean | `true` | Only the value `false` disables the indexer (as does setting the whole table to `false`). When disabled, the indexer has no section in the main index and writes no files. Its existing directory is left untouched; if it holds generated files, they are still not indexed as notes or searched. |
-| `dir` | string | `"index/"` followed by the indexer name (e.g. `"index/authors"`) | Root directory for the indexer's files, relative to the workspace root. See [Index directories](#index-directories) for the rules. |
-| `fallback` | string or `false` | `"Uncategorized"` for categories, `"Unknown"` otherwise | Bucket for notes without a value. It always sorts last. Set to `false` to leave such notes out of this index. |
-| `sort_by` | string | `"alphabetical"`; `"created"`/`"updated"` for the date indexers | Sort note entries by `alphabetical`, `created`, or `updated`. Ties are broken by case-insensitive title, then by note path. |
-| `sort_direction` | string | `"ascending"`; `"descending"` for the date indexers | Sort entries and child buckets in `ascending` or `descending` order. |
+| `dir` | string | `"index/"` followed by the indexer name (e.g. `"index/authors"`, `"index/bibtex/journal"`) | Root directory for the indexer's files, relative to the workspace root. See [Index directories](#index-directories) for the rules. |
+| `fallback` | string or `false` | `"Uncategorized"` for categories, `false` for BibTeX fields other than `keyword`, `"Unknown"` otherwise | Bucket for notes without a value. It always sorts last. Set to `false` to leave such notes out of this index. |
+| `sort_by` | string | `"alphabetical"`; `"created"`/`"updated"` for `created`/`updated` | Sort note entries by `alphabetical`, `created`, or `updated`. Ties are broken by case-insensitive title, then by note path. |
+| `sort_direction` | string | `"ascending"`; `"descending"` for the date indexers (including `bibtex.eventdate`) | Sort entries and child buckets in `ascending` or `descending` order. |
 | `title_formatter` | function | `function(meta) return meta.title end` | Format a note title from its normalized metadata table. |
 
 #### Categories
@@ -218,6 +401,7 @@ Values come from the `categories` metadata field.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `literature_fallback` | string or `false` | `"Literatures"` | Bucket for [literatures](#literatures), which have no categories. Like `fallback`, it sorts last (after other categories; if both are used, the two are ordered by name). If it equals `fallback`, notes and literatures share the bucket. Set to `false` to treat literatures like notes without categories (`fallback`). Search it with `category:literatures`. |
 | `subcategory_separator` | string | `"/"` | Separator for hierarchical values, such as `"a/b/c"`. |
 | `per_subcategory_index` | boolean | `true` | When `true`, write each category index to a separate file. When `false`, render the hierarchy in the main index. |
 | `list_subcategory_notes` | boolean | `false` | When `true`, add a `Notes` heading containing descendant notes. When `false`, list only direct notes under each category. |
@@ -246,6 +430,32 @@ month must be 1–12 and the day 1–31; otherwise, as with `2025-13-01` or
 | `granularity` | string | `"day"` | Finest bucket: `"year"`, `"month"`, or `"day"`. Any other value logs a warning and uses `"day"`. |
 | `per_period_index` | boolean | `true` | When `true`, write each period index to a separate file. When `false`, render the hierarchy in the main index. |
 | `list_subperiod_notes` | boolean | `false` | When `true`, add a `Notes` heading containing the notes of all subperiods. |
+
+#### BibTeX field indexers
+
+Each indexer in `config.bibtex` indexes one raw field of
+[literatures](#literatures) (see the table there for the fields and filters).
+`bibtex = false` disables all of them; otherwise each follows the usual rules
+(omitted or a table: enabled; `false` or `enabled = false`: disabled). Only
+literatures are indexed: notes are never listed, and `fallback` applies only to
+literatures without the field. Values keep their original spelling; values that
+differ only in case get separate buckets (see [File names](#file-names)).
+
+The flat indexers (all except `eventdate`) are not hierarchical. `keyword` splits
+the `keywords` field on `,` or `;`, trims the keywords, drops empty ones, and lists
+a literature once per keyword. The other fields have one value per literature,
+which is never split: `publisher = {Institute of Electrical and Electronics
+Engineers (IEEE)}` is one publisher.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `per_value_index` | boolean | `true` | When `true`, write each value's index to a separate file. When `false`, list values and their literatures in the main index. |
+
+`eventdate` is a date hierarchy with the options of
+[Created and updated](#created-and-updated) (`granularity`, `per_period_index`,
+`list_subperiod_notes`) and the same date parsing. For a range such as
+`2020-05-01/2020-05-03`, the start date is used. Its default `sort_by` is
+`"alphabetical"`.
 
 The indexer does not have a separate metadata-injection option. Generated index metadata follows `core.esupports.metagen`'s `type` setting:
 
@@ -285,7 +495,7 @@ set.
 
 ### File names
 
-Each part of a bucket path (a category level, an author name, a date component, or
+Each part of a bucket path (a category level, an author name, a BibTeX value, a date component, or
 a fallback name) becomes a file or directory name. Characters that are unsafe in
 file names or Norg links are encoded as `=` followed by two uppercase hexadecimal
 digits of the byte: `=`, `~`, `%`, `&`, `$`, `` ` ``, `/`, `\`, `:`, `[`, `]`,
@@ -332,6 +542,29 @@ index/authors/
 └── Unknown.norg            # notes without authors
 ```
 
+The flat BibTeX field indexes list only literatures, each under its own
+directory in `index/bibtex/`:
+
+```text
+index/bibtex/
+├── keyword/
+│   ├── Lossless.norg       # heading "Lossless"
+│   ├── lossless~2.norg     # heading "lossless"
+│   └── Unknown.norg        # literatures without keywords
+├── journal/
+│   └── IEEE Transactions on Audio, Speech, and Language Processing.norg
+├── type/
+│   └── phdthesis.norg      # BibTeX `type` field, not the entry type
+└── eventdate/
+    ├── 2020/
+    │   ├── 05/
+    │   │   └── 01.norg     # heading "2020-05-01"
+    │   └── 05.norg         # heading "2020-05"
+    └── 2020.norg           # heading "2020"
+```
+
+Categories put literatures in a flat `Literatures.norg` bucket.
+
 Date indexes are nested by year, month, and day, down to `granularity`. Headings
 and links show the full date prefix:
 
@@ -347,11 +580,26 @@ index/created/
 
 ### Inline mode
 
-When a per-file option (`per_subcategory_index`, `per_author_index`, or
+When a per-file option (`per_subcategory_index`, `per_author_index`,
+`per_value_index` of a BibTeX field, or
 `per_period_index`) is `false`, the indexer's hierarchy is rendered in the main
-index. Buckets start at heading level 3 and notes are one level below their
-bucket, while Norg has only six heading levels. Inline mode therefore suits
-shallow hierarchies: categories up to three levels deep fit, and dates with
-`granularity = "day"` already use all six levels. Deeper trees are not clamped
-and produce headings beyond level 6. Per-file indexes are recommended for deep
-category trees and for dates with `granularity = "day"`.
+index. Buckets start at heading level 3 (level 4 for the BibTeX field indexers,
+which are under the `** BibTeX` heading) and notes are one level below their
+bucket, while Norg has only six heading levels. Levels beyond 6 become nested
+unordered list items under the deepest heading: level 7 is `-`, level 8 is `--`,
+and so on. For example, `bibtex.eventdate` with `per_period_index = false` and
+`granularity = "day"`:
+
+```norg
+** BibTeX
+
+*** Event Dates
+**** 2020
+***** 2020-05
+****** 2020-05-01
+- {/ literature/fields.bib}[\[fields2021\] Fields]
+```
+
+Inline mode therefore reads best with shallow hierarchies: categories up to three
+levels deep and dates (except BibTeX event dates by day) are headings all the
+way down. Per-file indexes are recommended for deep category trees.
