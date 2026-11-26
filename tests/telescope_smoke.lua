@@ -268,6 +268,168 @@ local function run()
     picker:set_selection(0)
     await_preview(5, { { 5, 6, 11 } })
     actions.close(picker.prompt_bufnr)
+    delay_target = false
+
+    -- Literatures: a PDF entry, resolved from the `file` field, follows the .bib entry. Its preview
+    -- shows the .bib file, and selecting it opens the PDF with the system default application.
+    local bibtex = require("neorg.modules.external.indexer.bibtex")
+    bibtex.available = function()
+        return true
+    end
+    bibtex.read = function(_, path)
+        return {
+            citekey = "lit2020",
+            metadata = { title = "Smoke Literature" },
+            pdf = bibtex.find_pdf(path, { file = "Paper:papers/lit2020.pdf:PDF" }),
+        }
+    end
+    local bib = workspace .. "/lit/lit2020.bib"
+    local pdf = workspace .. "/lit/papers/lit2020.pdf"
+    vim.fn.mkdir(workspace .. "/lit/papers", "p")
+    vim.fn.writefile({ "@article{lit2020,", "  title = {Smoke Literature},", "}" }, bib)
+    local file = assert(io.open(pdf, "wb"))
+    file:write("%PDF-1.4\n\0\255binary\n")
+    file:close()
+    local opened = {}
+    local ui_open = vim.ui.open
+    vim.ui.open = function(path)
+        opened[#opened + 1] = path
+    end
+    picker = assert(indexer.search())
+    local bib_row = "lit/lit2020.bib:[lit2020] Smoke Literature"
+    local pdf_row = "lit/papers/lit2020.pdf:[PDF]:[lit2020] Smoke Literature"
+    await_rows("title:lit2020", { { nil, bib_row }, { nil, pdf_row } })
+    assert(picker.manager:get_entry(2).pdf == pdf)
+    picker:set_selection(1)
+    assert(vim.wait(2000, function()
+        local buf = vim.api.nvim_win_get_buf(picker.preview_win)
+        return vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1], "@article{lit2020,")
+    end), "the PDF entry does not preview its .bib file")
+    local search_picker = require("neorg.modules.external.indexer.search_picker")
+    search_picker.actions.open_pdf(picker.prompt_bufnr)
+    picker:set_selection(0)
+    search_picker.actions.open_pdf(picker.prompt_bufnr)
+    picker:set_selection(1)
+    actions.select_default(picker.prompt_bufnr)
+    assert(vim.deep_equal(opened, { pdf, pdf, pdf }), vim.inspect(opened))
+    assert(vim.api.nvim_buf_get_name(0) ~= pdf, "the PDF was loaded into a buffer")
+    -- With image.nvim (stubbed here), the PDF entry previews the first page, converted in the
+    -- background.
+    local pdf_preview = require("neorg.modules.external.indexer.pdf_preview")
+    local cache_dir, converter, system = pdf_preview.cache_dir, pdf_preview.converter, vim.system
+    pdf_preview.cache_dir = function()
+        return root .. "/cache"
+    end
+    pdf_preview.converter = function()
+        return "magick"
+    end
+    local conversions = {}
+    vim.system = function(cmd, _, on_exit)
+        assert(cmd[4] == pdf .. "[0]", vim.inspect(cmd))
+        conversions[#conversions + 1] = function(code)
+            if code == 0 then
+                vim.fn.writefile({ "png" }, cmd[#cmd]:sub(5))
+            end
+            on_exit({ code = code, stderr = "no Ghostscript" })
+        end
+        return {}
+    end
+    local images = {}
+    package.loaded.image = {
+        from_file = function(path, opts)
+            local image = { path = path, opts = opts, rendered = 0, cleared = 0 }
+            function image.render(self)
+                self.rendered = self.rendered + 1
+            end
+            function image.clear(self)
+                self.cleared = self.cleared + 1
+            end
+            images[#images + 1] = image
+            return image
+        end,
+    }
+    local function preview_lines(expected)
+        assert(vim.wait(2000, function()
+            local buf = vim.api.nvim_win_get_buf(picker.preview_win)
+            return vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, #expected, false), expected)
+        end), "preview does not show " .. vim.inspect(expected))
+    end
+    local bib_lines = { "@article{lit2020," }
+    picker = assert(indexer.search())
+    await_rows("title:lit2020", { { nil, bib_row }, { nil, pdf_row } })
+    picker:set_selection(1)
+    preview_lines({ vim.fn.fnamemodify(pdf, ":~"), "", "Rendering preview…" })
+    assert(#conversions == 1)
+    -- The conversion finishes after the selection moved: nothing is drawn.
+    picker:set_selection(0)
+    preview_lines(bib_lines)
+    conversions[1](0)
+    assert(vim.wait(2000, function()
+        return #vim.fn.glob(root .. "/cache/*.png", false, true) == 1
+    end))
+    vim.wait(50)
+    assert(#images == 0, "a stale conversion was drawn")
+    -- The cached PNG is drawn, fitted into the preview window, over an empty buffer.
+    picker:set_selection(1)
+    assert(vim.wait(2000, function()
+        return #images == 1 and images[1].rendered == 1
+    end), "the PDF preview was not drawn")
+    local win = picker.preview_win
+    local preview_buf = vim.api.nvim_win_get_buf(win)
+    assert(vim.deep_equal(images[1].opts, {
+        window = win,
+        buffer = preview_buf,
+        x = 0,
+        y = 0,
+        width = vim.api.nvim_win_get_width(win),
+        height = vim.api.nvim_win_get_height(win),
+    }), vim.inspect(images[1].opts))
+    assert(images[1].path:sub(1, #root) == root and #conversions == 1)
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(preview_buf, 0, -1, false), { "" }))
+    -- Other entries clear the image, and so does closing the picker.
+    picker:set_selection(0)
+    preview_lines(bib_lines)
+    assert(images[1].cleared == 1)
+    picker:set_selection(1)
+    assert(vim.wait(2000, function()
+        return #images == 2 and images[2].rendered == 1
+    end))
+    actions.close(picker.prompt_bufnr)
+    assert(images[2].cleared == 1 and images[1].cleared == 1)
+    -- A failed conversion falls back to the .bib file, with one warning.
+    file = assert(io.open(pdf, "ab"))
+    file:write("changed")
+    file:close()
+    local warnings = {}
+    vim.notify = function(message, level)
+        warnings[#warnings + 1] = { message, level }
+    end
+    picker = assert(indexer.search())
+    await_rows("title:lit2020", { { nil, bib_row }, { nil, pdf_row } })
+    picker:set_selection(1)
+    assert(vim.wait(2000, function()
+        return #conversions == 2
+    end))
+    conversions[2](1)
+    preview_lines(bib_lines)
+    picker:set_selection(0)
+    picker:set_selection(1)
+    preview_lines(bib_lines)
+    vim.notify = notify
+    assert(#warnings == 1 and warnings[1][1]:find("no Ghostscript", 1, true), vim.inspect(warnings))
+    assert(#conversions == 2 and #images == 2)
+    actions.close(picker.prompt_bufnr)
+    vim.system, pdf_preview.converter, pdf_preview.cache_dir = system, converter, cache_dir
+    package.loaded.image = nil
+    pdf_preview.reset()
+    -- Without a PDF, only the .bib entry is listed.
+    vim.fn.delete(pdf)
+    picker = assert(indexer.search({ previewer = false }))
+    await_rows("title:lit2020", { { nil, bib_row } })
+    actions.select_default(picker.prompt_bufnr)
+    assert(vim.uv.fs_realpath(vim.api.nvim_buf_get_name(0)) == vim.uv.fs_realpath(bib))
+    assert(#opened == 3)
+    vim.ui.open = ui_open
 end
 
 local ok, err = xpcall(run, debug.traceback)

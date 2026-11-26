@@ -26,6 +26,10 @@ Add the following to your Neorg plugin configuration:
                     search = {
                         search_content = true,
                         include_generated = false,
+                        pdf_preview = {
+                            enabled = true,
+                            density = 110,
+                        },
                         mappings = {
                             open_pdf = "<C-o>",
                         },
@@ -308,11 +312,37 @@ Literatures appear among the notes. Their title is `[citekey] title`, so plain
 terms and `title:` match the citekey too, and their body is the text of the `.bib`
 file, for example `literature/x.bib:12:  keywords = {Lossless},`. Metadata
 filters match literatures through the generated indexes. Opening a literature
-opens its `.bib` file (at the matched line). Press `<C-o>` (insert and normal
-mode, see `search.mappings.open_pdf`) to open the PDF of the selected literature
-with the system default application (`vim.ui.open`); it warns when the
-literature has no PDF. The action is also
-available as `require("neorg.modules.external.indexer.search_picker").actions.open_pdf`
+opens its `.bib` file (at the matched line).
+
+When a literature has a [PDF](#pdf) (from the `file` field of its entry), a
+matching literature is followed by a PDF entry: the PDF's path (relative to the
+workspace, or absolute with `~` when outside it), `[PDF]`, and the literature's
+title, with the matched title and metadata highlighted as on the literature's
+own results. It appears exactly when the literature matches, right after the
+literature's results, for example:
+
+```text
+literature/schlecht2017lossless.bib:[schlecht2017lossless] On Lossless Feedback Delay Networks
+literature/schlecht2017lossless.pdf:[PDF]:[schlecht2017lossless] On Lossless Feedback Delay Networks
+```
+
+Literatures without a PDF have no PDF entry. Opening a PDF entry with `<CR>` or
+Telescope's split, vertical split, tab, or drop mappings closes the picker and
+opens the PDF with the system default application (`vim.ui.open`) instead of
+loading it into a buffer. Its preview shows the first page of the PDF when
+[image.nvim](https://github.com/3rd/image.nvim) is installed and set up and
+ImageMagick (`magick`, or `convert` of ImageMagick 6) with Ghostscript is
+available (see `search.pdf_preview`); otherwise it shows the literature's `.bib`
+file. The page is rendered in the background and cached under
+`stdpath("cache")/neorg-indexer/pdf-preview/`; a failed rendering is not cached
+and is retried the next time the entry is previewed. Other
+Telescope actions that use the entry's file, such as sending results to the
+quickfix list, use the `.bib` file. Press `<C-o>` (insert and normal mode, see
+`search.mappings.open_pdf`) on a literature or a PDF entry to open the PDF with
+the system default application without closing the picker; it warns when the
+literature has no PDF. Only the selected entry is opened, not a multi-selection.
+The action is also available as
+`require("neorg.modules.external.indexer.search_picker").actions.open_pdf`
 for custom Telescope mappings.
 
 | Query | Matches |
@@ -395,7 +425,9 @@ Set these options in `config.search`:
 |--------|------|---------|-------------|
 | `search_content` | boolean | `true` | Let unqualified terms match the note body as well as the title. Set to `false` for title-only unqualified terms. Explicit `content:` queries always search the body. |
 | `include_generated` | boolean | `false` | Also search the main index file (`config.name`) and `.norg` files under each indexer's `dir` that holds generated files (see [Index directories](#index-directories)). All paths are relative to the workspace. |
-| `mappings.open_pdf` | string, table, or `false` | `"<C-o>"` | Picker key that opens the PDF of the selected literature. A string maps the key in insert and normal mode; a table such as `{ i = "<C-o>", n = "gp" }` maps each mode separately (modes without a key are not mapped); `false` disables the mapping. |
+| `pdf_preview.enabled` | boolean | `true` | Preview the first page of the PDF of a PDF entry as an image when image.nvim and ImageMagick are available. Set `pdf_preview = false` or `pdf_preview.enabled = false` to always preview the literature's `.bib` file. |
+| `pdf_preview.density` | number | `110` | Resolution (DPI) at which the first page is rasterized. |
+| `mappings.open_pdf` | string, table, or `false` | `"<C-o>"` | Picker key that opens the PDF of the selected literature or PDF entry. A string maps the key in insert and normal mode; a table such as `{ i = "<C-o>", n = "gp" }` maps each mode separately (modes without a key are not mapped); `false` disables the mapping. |
 
 ### Indexer options
 

@@ -987,11 +987,11 @@ local function run()
     assert(dirman.set_workspace("lit"))
     local state = require("telescope.actions.state")
     local actions = require("telescope.actions")
-    local function open_picker(prompt)
+    local function open_picker(prompt, count)
         local picker = assert(indexer.search({ previewer = false }))
         picker:set_prompt(prompt)
         await("results for " .. prompt, function()
-            return picker.manager and picker.manager:num_results() == 1
+            return picker.manager and picker.manager:num_results() == (count or 1)
         end)
         return picker
     end
@@ -1003,25 +1003,56 @@ local function run()
         end
     end
 
-    local picker = open_picker("title:schlecht2017")
-    assert(state.get_selected_entry().value.kind == "literature")
-    local display = state.get_selected_entry().display(state.get_selected_entry())
+    -- A literature with a PDF has a .bib entry and a PDF entry right after it.
+    local picker = open_picker("title:schlecht2017", 2)
+    local bib_entry, pdf_entry = picker.manager:get_entry(1), picker.manager:get_entry(2)
+    assert(bib_entry.value.kind == "literature" and not bib_entry.pdf)
+    local display = bib_entry.display(bib_entry)
     assert(
         display == "literature/schlecht2017lossless.bib:[schlecht2017lossless] On Lossless Feedback Delay Networks",
         display
     )
+    -- The PDF comes from the `file` field.
+    assert(pdf_entry.value == bib_entry.value and pdf_entry.pdf == lit.pdf and pdf_entry.path == lit.path)
+    display = pdf_entry.display(pdf_entry)
+    assert(
+        display
+            == "literature/schlecht2017lossless.pdf:[PDF]:[schlecht2017lossless] On Lossless Feedback Delay Networks",
+        display
+    )
     assert(mapping(picker.prompt_bufnr, "i", "<C-O>") and mapping(picker.prompt_bufnr, "n", "<C-O>"))
+    -- <C-o> opens the PDF from both entries.
+    assert(state.get_selected_entry() == bib_entry)
     picker_module.actions.open_pdf(picker.prompt_bufnr)
-    assert(vim.deep_equal(opened, { lit.pdf }), vim.inspect(opened))
-    actions.close(picker.prompt_bufnr)
+    picker:set_selection(1)
+    assert(state.get_selected_entry() == pdf_entry)
+    picker_module.actions.open_pdf(picker.prompt_bufnr)
+    assert(vim.deep_equal(opened, { lit.pdf, lit.pdf }), vim.inspect(opened))
+    -- <CR> on the PDF entry closes the picker and opens the PDF.
+    actions.select_default(picker.prompt_bufnr)
+    assert(vim.deep_equal(opened, { lit.pdf, lit.pdf, lit.pdf }), vim.inspect(opened))
+    assert(not vim.api.nvim_buf_is_valid(picker.prompt_bufnr), "the picker was not closed")
+    -- So do split, vsplit, and tab selections.
+    local windows = #vim.api.nvim_list_wins()
+    picker = open_picker("title:schlecht2017", 2)
+    picker:set_selection(1)
+    actions.select_vertical(picker.prompt_bufnr)
+    assert(#opened == 4 and opened[4] == lit.pdf, vim.inspect(opened))
+    assert(#vim.api.nvim_list_wins() == windows, "a split was opened for the PDF entry")
+    -- The .bib entry still opens the .bib file.
+    picker = open_picker("title:schlecht2017", 2)
+    actions.select_default(picker.prompt_bufnr)
+    assert(vim.uv.fs_realpath(vim.api.nvim_buf_get_name(0)) == vim.uv.fs_realpath(lit.path))
+    assert(#opened == 4)
+    opened = {}
 
-    -- No PDF, and notes: a warning and nothing opened.
+    -- No PDF, and notes: a single entry, a warning, and nothing opened.
     picker = open_picker("title:renamed")
     local since = #messages
     picker_module.actions.open_pdf(picker.prompt_bufnr)
     assert(count(vim.log.levels.WARN, "no PDF found", since) == 1)
     actions.close(picker.prompt_bufnr)
-    -- A same-name PDF next to a .bib file without a `file` field is not opened.
+    -- A same-name PDF next to a .bib file without a `file` field has no entry and is not opened.
     picker = open_picker("title:keywords")
     since = #messages
     picker_module.actions.open_pdf(picker.prompt_bufnr)
@@ -1031,23 +1062,24 @@ local function run()
     since = #messages
     picker_module.actions.open_pdf(picker.prompt_bufnr)
     assert(count(vim.log.levels.WARN, "is not a literature", since) == 1)
-    assert(#opened == 1)
+    assert(#opened == 0)
     -- <CR> opens the .bib file at the matched line.
     actions.close(picker.prompt_bufnr)
-    picker = open_picker("content:similarity")
+    picker = open_picker("content:similarity", 2)
+    assert(picker.manager:get_entry(1).lnum == lnum and picker.manager:get_entry(2).pdf == lit.pdf)
     actions.select_default(picker.prompt_bufnr)
     assert(vim.uv.fs_realpath(vim.api.nvim_buf_get_name(0)) == vim.uv.fs_realpath(lit.path))
     assert(vim.api.nvim_win_get_cursor(0)[1] == lnum)
 
     -- Configurable mappings.
     config.search.mappings.open_pdf = { i = "<C-y>" }
-    picker = open_picker("title:schlecht2017")
+    picker = open_picker("title:schlecht2017", 2)
     assert(mapping(picker.prompt_bufnr, "i", "<C-Y>") and not mapping(picker.prompt_bufnr, "n", "<C-Y>"))
     local map = mapping(picker.prompt_bufnr, "i", "<C-O>")
     assert(not map or map.desc ~= "Open the PDF of the literature")
     actions.close(picker.prompt_bufnr)
     config.search.mappings.open_pdf = false
-    picker = open_picker("title:schlecht2017")
+    picker = open_picker("title:schlecht2017", 2)
     for _, mode in ipairs({ "i", "n" }) do
         for _, keymap in ipairs(vim.api.nvim_buf_get_keymap(picker.prompt_bufnr, mode)) do
             assert(keymap.desc ~= "Open the PDF of the literature", keymap.lhs)

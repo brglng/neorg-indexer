@@ -56,6 +56,10 @@ module.config.public = {
     search = {
         search_content = true,
         include_generated = false,
+        pdf_preview = {
+            enabled = true,
+            density = 110,
+        },
         mappings = {
             open_pdf = "<C-o>",
         },

@@ -88,6 +88,292 @@ local function index_tests()
     assert(metadata["stray.norg"] == nil)
 end
 
+-- Picker entries: a literature with a PDF gets a PDF entry right after its rows.
+local function picker_tests()
+    local picker = require("neorg.modules.external.indexer.search_picker")
+    local root = "/ws"
+    local function literature(relative, title, pdf, body)
+        local lines = {}
+        for i, line in ipairs(body or {}) do
+            lines[i] = notes.text(line)
+            lines[i].lnum = i
+        end
+        return {
+            kind = "literature",
+            path = root .. "/" .. relative,
+            relative = relative,
+            title = notes.text(title),
+            pdf = pdf,
+            body = lines,
+            metadata = { authors = texts("Ada Lovelace") },
+        }
+    end
+    local snapshot = {
+        literature("lit/a.bib", "[a2020] Lossless delay", root .. "/papers/a.pdf", {
+            "@article{a2020,",
+            "  note = {lossless},",
+        }),
+        literature("lit/b.bib", "[b2021] Lossless network", nil, { "@article{b2021," }),
+        literature("lit/c.bib", "[c2022] Other", vim.fn.expand("~") .. "/outside/c.pdf", { "  note = {lossless}," }),
+        {
+            kind = "note",
+            path = root .. "/note.norg",
+            relative = "note.norg",
+            title = notes.text("lossless"),
+            body = {},
+            metadata = {},
+        },
+    }
+    local function rows(prompt, content)
+        local result = {}
+        for _, entry in ipairs(picker.entries(root, snapshot, query.parse(prompt), content)) do
+            local text = entry.display(entry)
+            result[#result + 1] = text
+            if entry.pdf then
+                -- PDF entries point to the PDF, but preview and paths use the .bib file.
+                assert(entry.pdf == entry.value.pdf and entry.path == entry.value.path and not entry.lnum)
+                assert(entry.ordinal:find("pdf", 1, true), entry.ordinal)
+            end
+        end
+        return result
+    end
+    local function check(prompt, content, expected)
+        local actual = rows(prompt, content)
+        assert(vim.deep_equal(actual, expected), prompt .. ": " .. vim.inspect(actual))
+    end
+    check("lossless", false, {
+        "lit/a.bib:[a2020] Lossless delay",
+        "papers/a.pdf:[PDF]:[a2020] Lossless delay",
+        "lit/b.bib:[b2021] Lossless network",
+        "note.norg:lossless",
+    })
+    -- Body rows come first, then the PDF entry; title matches still rank first.
+    check("lossless | content:lossless", true, {
+        "lit/a.bib:[a2020] Lossless delay",
+        "lit/a.bib:2:  note = {lossless},",
+        "papers/a.pdf:[PDF]:[a2020] Lossless delay",
+        "lit/b.bib:[b2021] Lossless network",
+        "note.norg:lossless",
+        "lit/c.bib:1:  note = {lossless},",
+        "~/outside/c.pdf:[PDF]:[c2022] Other",
+    })
+    -- Metadata hits are shown on the PDF entry too.
+    check("author:ada a2020", false, {
+        "lit/a.bib:[authors: Ada Lovelace]:[a2020] Lossless delay",
+        "papers/a.pdf:[PDF]:[authors: Ada Lovelace]:[a2020] Lossless delay",
+    })
+    check("network", false, { "lit/b.bib:[b2021] Lossless network" })
+    check("missing", false, {})
+    check("", false, {})
+    local entry = picker.entries(root, snapshot, query.parse("a2020"), false)[2]
+    local text, highlights = entry.display(entry)
+    local range = highlights[1][1]
+    assert(#highlights == 1 and text:sub(range[1] + 1, range[2]) == "a2020", vim.inspect(highlights))
+end
+
+-- PDF previews: options, cache keys, the ImageMagick command, and asynchronous conversion.
+local function pdf_preview_tests()
+    local pdf_preview = require("neorg.modules.external.indexer.pdf_preview")
+    assert(pdf_preview.options(false) == nil and pdf_preview.options({ enabled = false }) == nil)
+    assert(vim.deep_equal(pdf_preview.options(true), { density = 110 }))
+    assert(vim.deep_equal(pdf_preview.options(nil), { density = 110 }))
+    assert(vim.deep_equal(pdf_preview.options({ enabled = true, density = 200 }), { density = 200 }))
+    assert(vim.deep_equal(pdf_preview.options({ density = -1 }), { density = 110 }))
+
+    local stat = { mtime = { sec = 1, nsec = 2 }, size = 3 }
+    local path = pdf_preview.cache_path("/a.pdf", stat, 110)
+    assert(path:match("/neorg%-indexer/pdf%-preview/%x+%.png$"), path)
+    assert(path:sub(1, #vim.fn.stdpath("cache")) == vim.fn.stdpath("cache"))
+    assert(path == pdf_preview.cache_path("/a.pdf", vim.deepcopy(stat), 110))
+    for _, other in ipairs({
+        pdf_preview.cache_path("/b.pdf", stat, 110),
+        pdf_preview.cache_path("/a.pdf", { mtime = { sec = 1, nsec = 3 }, size = 3 }, 110),
+        pdf_preview.cache_path("/a.pdf", { mtime = { sec = 1, nsec = 2 }, size = 4 }, 110),
+        pdf_preview.cache_path("/a.pdf", stat, 120),
+    }) do
+        assert(other ~= path)
+    end
+    assert(vim.deep_equal(pdf_preview.command("magick", "/a b.pdf", "/c.png", 110), {
+        "magick", "-density", "110", "/a b.pdf[0]", "-background", "white", "-alpha", "remove", "png:/c.png",
+    }))
+
+    local root = vim.fn.tempname()
+    local cache_dir, converter, system = pdf_preview.cache_dir, pdf_preview.converter, vim.system
+    pdf_preview.cache_dir = function()
+        return root .. "/cache"
+    end
+    local pdf = root .. "/a.pdf"
+    write(pdf, { "%PDF-1.4" })
+    local commands, exits = {}, {}
+    vim.system = function(cmd, _, on_exit)
+        commands[#commands + 1] = cmd
+        exits[#exits + 1] = on_exit
+        return {}
+    end
+    local function finish(i, code, stderr)
+        if code == 0 then
+            write(commands[i][#commands[i]]:sub(5), { "png" })
+        end
+        -- vim.system calls on_exit outside the main loop.
+        vim.uv.new_timer():start(0, 0, function()
+            exits[i]({ code = code, stderr = stderr })
+        end)
+    end
+    local results = {}
+    local function rasterize(name, target)
+        pdf_preview.rasterize(target or pdf, { density = 110 }, function(png, err)
+            results[#results + 1] = { name, png, err }
+        end)
+    end
+    local function await(count)
+        assert(vim.wait(2000, function()
+            return #results == count
+        end), vim.inspect(results))
+    end
+    local ok, err = pcall(function()
+        pdf_preview.reset()
+        pdf_preview.converter = function()
+            return nil
+        end
+        rasterize("missing")
+        assert(#results == 0, "the callback ran synchronously")
+        await(1)
+        assert(results[1][2] == nil and results[1][3] == "ImageMagick is not installed" and #commands == 0)
+        assert(pdf_preview.available() == nil)
+        pdf_preview.converter = function()
+            return "magick"
+        end
+        -- Concurrent requests share one conversion.
+        rasterize("first")
+        rasterize("second")
+        assert(#commands == 1 and commands[1][1] == "magick" and commands[1][4] == pdf .. "[0]")
+        local png = pdf_preview.cache_path(pdf, vim.uv.fs_stat(pdf), 110)
+        assert(commands[1][#commands[1]]:match("^png:" .. vim.pesc(png) .. "%.%d+%.tmp$"))
+        finish(1, 0)
+        await(3)
+        assert(vim.deep_equal(results[2], { "first", png }) and vim.deep_equal(results[3], { "second", png }))
+        assert(vim.fn.filereadable(png) == 1 and #vim.fn.glob(root .. "/cache/*.tmp", false, true) == 0)
+        -- The cached PNG is reused.
+        rasterize("cached")
+        await(4)
+        assert(results[4][2] == png and #commands == 1)
+        -- A changed PDF is converted again; failures are reported, not cached, and retried.
+        write(pdf, { "%PDF-1.4", "changed" })
+        rasterize("failed")
+        assert(#commands == 2)
+        finish(2, 1, "gs: command not found\n")
+        await(5)
+        assert(results[5][2] == nil and results[5][3] == "gs: command not found", vim.inspect(results[5]))
+        assert(#vim.fn.glob(root .. "/cache/*", false, true) == 1)
+        rasterize("failed again")
+        assert(#commands == 3)
+        -- An empty output is a failure too, and is not cached.
+        write(commands[3][#commands[3]]:sub(5), {})
+        vim.uv.new_timer():start(0, 0, function()
+            exits[3]({ code = 0, stderr = "" })
+        end)
+        await(6)
+        assert(results[6][2] == nil and results[6][3] == "ImageMagick exited with code 0", vim.inspect(results[6]))
+        assert(#vim.fn.glob(root .. "/cache/*", false, true) == 1)
+        rasterize("retried")
+        assert(#commands == 4)
+        finish(4, 0)
+        await(7)
+        local changed = pdf_preview.cache_path(pdf, vim.uv.fs_stat(pdf), 110)
+        assert(results[7][2] == changed and vim.fn.filereadable(changed) == 1, vim.inspect(results[7]))
+        rasterize("unreadable", root .. "/missing.pdf")
+        await(8)
+        assert(results[8][3]:find("cannot read", 1, true))
+
+        -- image.nvim is optional; without it there is no preview.
+        package.loaded.image = nil
+        assert(pdf_preview.available() == nil)
+        local calls = {}
+        local image = {
+            from_file = function(file, opts)
+                calls[#calls + 1] = { file, opts }
+                return {
+                    render = function()
+                        calls[#calls + 1] = "render"
+                    end,
+                    clear = function()
+                        calls[#calls + 1] = "clear"
+                    end,
+                }
+            end,
+        }
+        package.loaded.image = image
+        assert(pdf_preview.available() == image)
+        local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+        local img = assert(pdf_preview.show(image, png, win, buf))
+        assert(vim.deep_equal(calls, {
+            {
+                png,
+                {
+                    window = win,
+                    buffer = buf,
+                    x = 0,
+                    y = 0,
+                    width = vim.api.nvim_win_get_width(win),
+                    height = vim.api.nvim_win_get_height(win),
+                },
+            },
+            "render",
+        }))
+        img.clear()
+        -- A PNG that image.nvim cannot read is removed from the cache.
+        local from_file = image.from_file
+        image.from_file = function()
+            return nil
+        end
+        local unreadable, reason = pdf_preview.show(image, changed, win, buf)
+        assert(unreadable == nil and reason:find("cannot read", 1, true))
+        assert(vim.fn.filereadable(changed) == 0 and pdf_preview.available() == image)
+        image.from_file = from_file
+        -- image.nvim throws before setup(); previews are then disabled for the session.
+        image.from_file = function()
+            error("image.nvim is not setup. Call setup() first.")
+        end
+        local none, message = pdf_preview.show(image, png, win, buf)
+        assert(none == nil and message:find("not setup", 1, true))
+        assert(pdf_preview.available() == nil)
+        local notified = {}
+        local notify = vim.notify
+        vim.notify = function(text, level)
+            notified[#notified + 1] = { text, level }
+        end
+        pdf_preview.warn("first")
+        pdf_preview.warn("second")
+        vim.notify = notify
+        assert(#notified == 1 and notified[1][1]:find("first", 1, true) and notified[1][2] == vim.log.levels.WARN)
+    end)
+    vim.system, pdf_preview.converter, pdf_preview.cache_dir = system, converter, cache_dir
+    package.loaded.image = nil
+    pdf_preview.reset()
+    assert(ok, err)
+
+    -- A real conversion with ImageMagick and Ghostscript, when installed.
+    if vim.fn.executable("gs") == 1 and pdf_preview.converter() then
+        pdf_preview.cache_dir = function()
+            return root .. "/real-cache"
+        end
+        local sample = root .. "/sample.pdf"
+        local made = vim.system({ pdf_preview.converter(), "-size", "20x30", "xc:red", sample }):wait()
+        assert(made.code == 0, made.stderr)
+        local png, failure
+        pdf_preview.rasterize(sample, { density = 72 }, function(result, message)
+            png, failure = result or false, message
+        end)
+        assert(vim.wait(20000, function()
+            return png ~= nil
+        end), "ImageMagick did not finish")
+        assert(png and vim.fn.readblob(png):sub(2, 4) == "PNG", failure)
+        pdf_preview.cache_dir = cache_dir
+        pdf_preview.reset()
+    end
+    vim.fn.delete(root, "rf")
+end
+
 local function run()
     local note = notes.parse("/workspace/topic.norg", "topic.norg", ([=[
 @document.meta
@@ -265,6 +551,8 @@ end
 
 local ok, err = xpcall(function()
     index_tests()
+    picker_tests()
+    pdf_preview_tests()
     run()
 end, debug.traceback)
 if not ok then
