@@ -175,7 +175,20 @@ local function run()
     local headings = vim.tbl_filter(function(line)
         return line:match("^%*%*? ") ~= nil
     end, read("index.norg"))
-    assert(vim.deep_equal(headings, { "* Index", "** Categories", "** Authors", "** Created", "** Updated" }))
+    -- Enabled indexers without buckets have no section: without .bib files, no BibTeX section and
+    -- no "** BibTeX" group heading.
+    local expected_headings = { "* Index", "** Categories", "** Authors", "** Created", "** Updated" }
+    assert(vim.deep_equal(headings, expected_headings), vim.inspect(headings))
+    assert(not vim.tbl_contains(read("index.norg"), "** BibTeX"))
+    -- Levels deeper than the deepest Norg heading become nested list items.
+    assert(indexers.heading_prefix(6) == "******")
+    assert(indexers.heading_prefix(7) == "-")
+    assert(indexers.heading_prefix(8) == "--")
+    -- Notes are never listed in the BibTeX indexes, not even in the keyword fallback bucket.
+    for _, field in ipairs(indexers.bibtex_fields) do
+        assert(section(field.title) == nil, vim.inspect(section(field.title)))
+        assert(vim.fn.isdirectory(ws .. "/index/bibtex/" .. field.name) == 0)
+    end
 
     -- Bucket files and parent links.
     assert(has("index/categories/a.norg", "* a"))
@@ -274,6 +287,51 @@ local function run()
     assert(vim.deep_equal(values("c.norg", "updated"), { "Unknown" }))
     assert(vim.deep_equal(values("c.norg", "authors"), {}))
     assert(vim.deep_equal(values("a.norg", "categories"), {}))
+
+    -- A section is listed only while its index has buckets: partial updates remove it when its
+    -- last bucket goes and add it back with its first bucket.
+    local a_lines, b_lines = vim.fn.readfile(ws .. "/a.norg"), vim.fn.readfile(ws .. "/b.norg")
+    local function without_authors(lines)
+        return vim.tbl_filter(function(line)
+            return line ~= "  Ada Lovelace" and line ~= "author: Ada Lovelace"
+        end, lines)
+    end
+    vim.fn.writefile(without_authors(a_lines), ws .. "/a.norg")
+    vim.fn.writefile(without_authors(b_lines), ws .. "/b.norg")
+    index({ changed_files = { ws .. "/a.norg", ws .. "/b.norg" } })
+    assert(section("Authors") == nil, vim.inspect(read("index.norg")))
+    assert(not read("index/authors/Ada Lovelace.norg"))
+    assert(section("Created") and section("Updated"))
+    metadata = search_index.read(ws, config)
+    assert(vim.deep_equal(values("a.norg", "authors"), {}))
+    assert(vim.deep_equal(values("b.norg", "updated"), { "2025-04-03" }))
+    vim.fn.writefile(a_lines, ws .. "/a.norg")
+    index({ changed_files = { ws .. "/a.norg" } })
+    assert(vim.deep_equal(section("Authors"), { "*** {:index/authors/Ada Lovelace:}[Ada Lovelace]" }))
+    assert(has("index/authors/Ada Lovelace.norg", "** {:$/a:}[A]"))
+    assert(not has("index/authors/Ada Lovelace.norg", "** {:$/b:}[B]"))
+    vim.fn.writefile(b_lines, ws .. "/b.norg")
+    index({ changed_files = { ws .. "/b.norg" } })
+    assert(has("index/authors/Ada Lovelace.norg", "** {:$/b:}[B]"))
+    -- Without any section, the main index keeps its "* Index" heading.
+    local saved = {}
+    for _, key in ipairs({ "authors", "created", "updated" }) do
+        saved[key] = config[key].enabled
+        config[key].enabled = false
+    end
+    local bibtex_config = config.bibtex
+    config.bibtex = false
+    index()
+    headings = vim.tbl_filter(function(line)
+        return line:match("^%*+ ") ~= nil
+    end, read("index.norg"))
+    assert(vim.deep_equal(headings, { "* Index" }), vim.inspect(read("index.norg")))
+    for key, enabled in pairs(saved) do
+        config[key].enabled = enabled
+    end
+    config.bibtex = bibtex_config
+    index()
+    assert(section("Authors") and section("Created") and section("Updated"))
     -- The disabled indexer's marked directory is excluded from search and from the watcher.
     assert(vim.tbl_contains(search_index.generated_paths(config, ws), "index/categories"))
     assert(not vim.tbl_contains(search_index.generated_paths(config), "index/categories"))
@@ -285,21 +343,37 @@ local function run()
         local keys = {}
         for _, ix in ipairs(indexers.enabled({ name = "index.norg" })) do
             keys[#keys + 1] = ix.def.key
-            assert(ix.dir == "index/" .. ix.def.key, vim.inspect(ix.dir))
+            assert(ix.dir == "index/" .. ix.def.key:gsub("%.", "/"), vim.inspect(ix.dir))
         end
-        assert(vim.deep_equal(keys, { "categories", "authors", "created", "updated" }), vim.inspect(keys))
+        local expected_keys = { "categories", "authors", "created", "updated" }
+        for _, field in ipairs(indexers.bibtex_fields) do
+            expected_keys[#expected_keys + 1] = "bibtex." .. field.name
+        end
+        assert(vim.deep_equal(keys, expected_keys), vim.inspect(keys))
         local partial = indexers.enabled({
             name = "index.norg",
             categories = { enabled = false },
             authors = { dir = "people" },
             created = { enabled = "no" },
             updated = false,
+            bibtex = false,
         })
         keys = {}
         for _, ix in ipairs(partial) do
             keys[#keys + 1] = ix.def.key
         end
         assert(vim.deep_equal(keys, { "authors", "created" }), vim.inspect(keys))
+        -- Each BibTeX indexer follows the normal rules inside the `bibtex` group.
+        local bib = indexers.enabled({
+            name = "index.norg",
+            bibtex = { keyword = false, journal = { enabled = false }, type = { dir = "types" } },
+        })
+        keys = {}
+        for _, ix in ipairs(bib) do
+            keys[ix.def.key] = ix.dir
+        end
+        assert(keys["bibtex.keyword"] == nil and keys["bibtex.journal"] == nil)
+        assert(keys["bibtex.type"] == "types" and keys["bibtex.publisher"] == "index/bibtex/publisher")
         assert(partial[1].dir == "people" and partial[1].config.fallback == "Unknown")
         assert(partial[1].config.title_formatter == indexers.default_title_formatter)
     end
@@ -316,30 +390,53 @@ local function run()
         end
         return result
     end
-    local function dirs(categories, authors, created, updated, name)
+    local function dirs(categories, authors, created, updated, name, keywords)
         return {
             name = name or "index.norg",
             categories = { dir = categories },
             authors = { dir = authors },
             created = { dir = created },
             updated = { dir = updated, enabled = updated ~= "off" },
+            bibtex = { keyword = { dir = keywords or "k" } },
         }
     end
+    local function errors_of(cfg)
+        local result = errors_for(cfg)
+        local keyword = result["bibtex.keyword"]
+        for key, err in pairs(result) do
+            if key:match("^bibtex%.") then
+                -- Sibling directories under index/bibtex never conflict.
+                assert(key == "bibtex.keyword" or not err, key)
+                result[key] = nil
+            end
+        end
+        result.bibtex_keyword = keyword
+        return result
+    end
     assert(vim.deep_equal(
-        errors_for(dirs("c", "a", "x", "x")),
-        { categories = false, authors = false, created = true, updated = true }
+        errors_of(dirs("c", "a", "x", "x")),
+        { categories = false, authors = false, created = true, updated = true, bibtex_keyword = false }
     ))
     assert(vim.deep_equal(
-        errors_for(dirs("c", "a", "x", "X/y")),
-        { categories = false, authors = false, created = true, updated = true }
+        errors_of(dirs("c", "a", "x", "X/y")),
+        { categories = false, authors = false, created = true, updated = true, bibtex_keyword = false }
     ))
     -- A disabled indexer does not conflict.
     assert(vim.deep_equal(
-        errors_for(dirs("c", "a", "x", "off")),
-        { categories = false, authors = false, created = false, updated = false }
+        errors_of(dirs("c", "a", "x", "off")),
+        { categories = false, authors = false, created = false, updated = false, bibtex_keyword = false }
     ))
-    assert(errors_for(dirs("c", "index.norg", "x", "u")).authors)
-    assert(errors_for(dirs("c", "notes", "x", "u", "notes/index.norg")).authors)
+    assert(errors_of(dirs("c", "index.norg", "x", "u")).authors)
+    assert(errors_of(dirs("c", "notes", "x", "u", "notes/index.norg")).authors)
+    assert(vim.deep_equal(
+        errors_of(dirs("c", "a", "x", "u", nil, "a/k")),
+        { categories = false, authors = true, created = false, updated = false, bibtex_keyword = true }
+    ))
+
+    assert(errors_for({ name = "index.norg", bibtex = { journal = { dir = "index/bibtex" } } })["bibtex.journal"])
+    assert(
+        errors_for({ name = "index.norg", bibtex = { journal = { dir = "index/bibtex/keyword/j" } } })["bibtex.keyword"]
+    )
 
     -- Date parsing.
     local created_def = indexers.list[3]

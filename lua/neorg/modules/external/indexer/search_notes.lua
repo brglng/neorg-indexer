@@ -80,7 +80,43 @@ function M.parse(path, relative, source)
 
     local stem = relative:match("([^/]+)$"):sub(1, -6)
     local title = metadata.title and metadata.title[1] or text(stem)
-    return { path = path, relative = relative, title = title, body = body, metadata = {} }
+    return { kind = "note", path = path, relative = relative, title = title, body = body, metadata = {} }
+end
+
+--- Parse a .bib file as a literature: its title is "[citekey] title" and its body is the raw
+--- lines of the file.
+--- @return table|nil nil when the bibtex parser is unavailable or the file has no entry
+function M.parse_bib(path, relative, source)
+    local bibtex = require("neorg.modules.external.indexer.bibtex")
+    if not bibtex.available() then
+        bibtex.warn_unavailable()
+        return nil
+    end
+    local item = bibtex.read(source, path)
+    if not item then
+        return nil
+    end
+    local body = {}
+    local lnum = 0
+    for line in (source .. "\n"):gmatch("([^\n]*)\n") do
+        lnum = lnum + 1
+        line = line:gsub("\r$", "")
+        if line ~= "" then
+            local body_line = text(line)
+            body_line.lnum = lnum
+            body[#body + 1] = body_line
+        end
+    end
+    return {
+        kind = "literature",
+        path = path,
+        relative = relative,
+        title = text("[" .. item.citekey .. "] " .. item.metadata.title),
+        citekey = item.citekey,
+        pdf = item.pdf,
+        body = body,
+        metadata = {},
+    }
 end
 
 -- Yield between batches, including during traversal. Never follow directory or
@@ -124,13 +160,18 @@ function M.scan(root, excluded, active, done, metadata)
                 local path = vim.fs.joinpath(root, relative)
                 if kind == "directory" and not skip[path] then
                     dirs[#dirs + 1] = { path = path, relative = relative .. "/" }
-                elseif kind == "file" and name:sub(-5) == ".norg" and not skip[path] then
+                elseif kind == "file" and (name:sub(-5) == ".norg" or name:sub(-4) == ".bib") and not skip[path] then
                     local file = io.open(path, "rb")
                     if file then
                         local source = file:read("*a")
                         file:close()
-                        if source then
-                            local note = M.parse(path, relative, source)
+                        local note
+                        if source and name:sub(-4) == ".bib" then
+                            note = M.parse_bib(path, relative, source)
+                        elseif source then
+                            note = M.parse(path, relative, source)
+                        end
+                        if note then
                             note.metadata = metadata and metadata[relative] or {}
                             notes[#notes + 1] = note
                         end

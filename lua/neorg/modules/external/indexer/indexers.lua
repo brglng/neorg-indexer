@@ -15,6 +15,7 @@ M.defaults = {
         enabled = true,
         dir = "index/categories",
         fallback = "Uncategorized",
+        literature_fallback = "Literatures",
         subcategory_separator = "/",
         per_subcategory_index = true,
         list_subcategory_notes = false,
@@ -55,13 +56,94 @@ M.defaults = {
     },
 }
 
+--- Heading that groups the sections of the BibTeX field indexers in index.norg.
+M.bibtex_group = "BibTeX"
+
+--- BibTeX fields indexed by the indexers under `bibtex`, in index.norg section order. Flat fields
+--- have one value per literature, except `keyword`, which is split on "," and ";". `eventdate` is a
+--- date hierarchy. `label` is the name of a search match when it differs from `name`. `title` is
+--- the section heading under the `BibTeX` group heading.
+M.bibtex_fields = {
+    { name = "keyword", title = "Keywords", label = "keywords" },
+    { name = "booktitle", title = "Book Titles" },
+    { name = "institution", title = "Institutions" },
+    { name = "journal", title = "Journals" },
+    { name = "key", title = "Keys", label = "bibtex_key" },
+    { name = "organization", title = "Organizations" },
+    { name = "publisher", title = "Publishers" },
+    { name = "school", title = "Schools" },
+    { name = "type", title = "Types", label = "bibtex_type" },
+    { name = "language", title = "Languages" },
+    { name = "journaltitle", title = "Journal Titles" },
+    { name = "location", title = "Locations" },
+    { name = "eventdate", title = "Event Dates", date = true },
+    { name = "pubstate", title = "Publication States" },
+}
+
+M.defaults.bibtex = {}
+for _, field in ipairs(M.bibtex_fields) do
+    if field.date then
+        M.defaults.bibtex[field.name] = {
+            enabled = true,
+            dir = "index/bibtex/" .. field.name,
+            fallback = false,
+            granularity = "day",
+            per_period_index = true,
+            list_subperiod_notes = false,
+            sort_by = "alphabetical",
+            sort_direction = "descending",
+            title_formatter = M.default_title_formatter,
+        }
+    else
+        M.defaults.bibtex[field.name] = {
+            enabled = true,
+            dir = "index/bibtex/" .. field.name,
+            -- Only keywords are common enough for a fallback bucket.
+            fallback = field.name == "keyword" and "Unknown" or false,
+            per_value_index = true,
+            sort_by = "alphabetical",
+            sort_direction = "ascending",
+            title_formatter = M.default_title_formatter,
+        }
+    end
+end
+
+--- Default options of an indexer.
+--- @param key string indexer key, dotted for nested indexers (e.g. "bibtex.keyword")
+--- @return table|nil
+local function get_defaults(key)
+    local value = M.defaults
+    for _, part in ipairs(vim.split(key, ".", { plain = true })) do
+        value = type(value) == "table" and value[part] or nil
+    end
+    return value
+end
+
+--- Configured options of an indexer. A nested indexer is disabled when its group is `false`.
+--- @param config table external.indexer public configuration
+--- @param key string indexer key, dotted for nested indexers (e.g. "bibtex.keyword")
+--- @return any
+function M.get_config(config, key)
+    local value = config
+    for _, part in ipairs(vim.split(key, ".", { plain = true })) do
+        if value == false then
+            return false
+        end
+        if type(value) ~= "table" then
+            return nil
+        end
+        value = value[part]
+    end
+    return value
+end
+
 --- Merge an indexer's configured options over its defaults.
 --- A missing configuration yields the defaults, so the indexer is enabled; `false` disables it.
---- @param key string indexer key
+--- @param key string indexer key, dotted for nested indexers (e.g. "bibtex.keyword")
 --- @param cfg any configured options
 --- @return table
 function M.resolve_config(key, cfg)
-    local defaults = vim.deepcopy(M.defaults[key] or {})
+    local defaults = vim.deepcopy(get_defaults(key) or {})
     if cfg == false then
         defaults.enabled = false
         return defaults
@@ -171,14 +253,17 @@ local function last(labels)
     return labels[#labels]
 end
 
-local function date_indexer(key, title)
+--- @param key string indexer key
+--- @param title string section title
+--- @param get fun(metadata: table): any date value of a note
+local function date_indexer(key, title, get)
     return {
         key = key,
         title = title,
         per_file = "per_period_index",
         list_notes = "list_subperiod_notes",
         values = function(metadata, config)
-            return date_values(metadata[key], config.granularity)
+            return date_values(get(metadata), config.granularity)
         end,
         label = function(path_parts)
             return table.concat(path_parts, "-")
@@ -200,6 +285,8 @@ end
 --- - file_value(path_parts, heading, config): searchable value of a bucket file, from its decoded path
 ---   parts under the indexer directory and its first heading (unescaped)
 --- - ancestor_separator(config): separator between a value and its descendants, if hierarchical
+--- - literature_only: when true, notes are never listed, not even in the fallback bucket
+--- - group: title of the level-2 heading that holds the section, which is then a level-3 heading
 M.list = {
     {
         key = "categories",
@@ -249,9 +336,97 @@ M.list = {
             return nil
         end,
     },
-    date_indexer("created", "Created"),
-    date_indexer("updated", "Updated"),
+    date_indexer("created", "Created", function(metadata)
+        return metadata.created
+    end),
+    date_indexer("updated", "Updated", function(metadata)
+        return metadata.updated
+    end),
 }
+
+--- Cleaned BibTeX fields of a literature.
+--- @param metadata table
+--- @return table|nil
+local function bibtex_fields(metadata)
+    local bibtex = metadata.bibtex
+    if metadata.kind ~= "literature" or type(bibtex) ~= "table" or type(bibtex.fields) ~= "table" then
+        return nil
+    end
+    return bibtex.fields
+end
+
+--- Start of a biblatex date range ("2020-05-01/2020-05-03"); other dates are returned unchanged.
+--- @param value any
+--- @return any
+function M.range_start(value)
+    if type(value) ~= "string" then
+        return value
+    end
+    return value:match("^(.-)/") or value
+end
+
+for _, field in ipairs(M.bibtex_fields) do
+    local def
+    if field.date then
+        def = date_indexer("bibtex." .. field.name, field.title, function(metadata)
+            local fields = bibtex_fields(metadata)
+            return fields and M.range_start(fields[field.name])
+        end)
+    else
+        def = {
+            key = "bibtex." .. field.name,
+            title = field.title,
+            per_file = "per_value_index",
+            values = function(metadata)
+                local fields = bibtex_fields(metadata)
+                local values
+                if not fields then
+                    values = {}
+                elseif field.name == "keyword" then
+                    values = require("neorg.modules.external.indexer.bibtex").split_keywords(fields.keywords)
+                else
+                    -- One value per literature: names like "A and B" are not split.
+                    values = M.list_values(fields[field.name])
+                end
+                return vim.tbl_map(function(value)
+                    return { value }
+                end, values)
+            end,
+            label = last,
+            inline_value = last,
+            file_value = function(_, heading)
+                return heading
+            end,
+            ancestor_separator = function()
+                return nil
+            end,
+        }
+    end
+    def.group = M.bibtex_group
+    def.literature_only = true
+    M.list[#M.list + 1] = def
+end
+
+--- Full name of an indexer, including its group (e.g. "BibTeX Keywords").
+--- @param def table indexer definition
+--- @return string
+function M.full_title(def)
+    return def.group and (def.group .. " " .. def.title) or def.title
+end
+
+--- Deepest Norg heading level.
+M.max_heading_level = 6
+
+--- Prefix of a generated heading line. Levels deeper than Norg headings allow become nested
+--- unordered list items under the deepest heading: level 7 is "-", level 8 is "--", and so on.
+--- @param level integer
+--- @return string
+function M.heading_prefix(level)
+    if level <= M.max_heading_level then
+        return string.rep("*", level)
+    end
+    return string.rep("-", level - M.max_heading_level)
+end
 
 --- Name of the marker file that identifies a directory generated by the indexer.
 M.marker = ".neorg-indexer"
@@ -329,7 +504,7 @@ function M.configured(config)
     local index_rel = vim.fs.normalize(config.name or "")
     local result = {}
     for _, def in ipairs(M.list) do
-        local cfg = M.resolve_config(def.key, config[def.key])
+        local cfg = M.resolve_config(def.key, M.get_config(config, def.key))
         do
             local dir, err = M.normalize_dir(cfg.dir)
             local ix = {

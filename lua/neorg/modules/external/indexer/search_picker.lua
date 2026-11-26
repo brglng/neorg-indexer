@@ -3,6 +3,51 @@ local query = require("neorg.modules.external.indexer.search_query")
 
 local M = {}
 
+--- Picker actions. Each takes the prompt buffer number, like Telescope actions.
+M.actions = {}
+
+--- Open the PDF of the selected literature with the system default application.
+--- @param prompt_bufnr integer
+function M.actions.open_pdf(prompt_bufnr)
+    local entry = require("telescope.actions.state").get_selected_entry(prompt_bufnr)
+    local item = entry and entry.value
+    if not item then
+        return
+    end
+    if item.kind ~= "literature" then
+        vim.notify("Neorg indexer: " .. item.relative .. " is not a literature", vim.log.levels.WARN)
+        return
+    end
+    if not item.pdf or vim.fn.filereadable(item.pdf) ~= 1 then
+        vim.notify("Neorg indexer: no PDF found for " .. item.relative, vim.log.levels.WARN)
+        return
+    end
+    vim.ui.open(item.pdf)
+end
+
+--- Keys of the open_pdf mapping per mode.
+--- @param value any `search.mappings.open_pdf`: a key for insert and normal mode, a table
+--- `{ i = key, n = key }`, or `false` to disable the mapping
+--- @return table map of mode -> key
+function M.mapping_keys(value)
+    if value == nil then
+        value = "<C-o>"
+    end
+    if type(value) == "string" then
+        return { i = value, n = value }
+    end
+    if type(value) == "table" then
+        local keys = {}
+        for _, mode in ipairs({ "i", "n" }) do
+            if type(value[mode]) == "string" then
+                keys[mode] = value[mode]
+            end
+        end
+        return keys
+    end
+    return {}
+end
+
 local function oneline(value)
     -- Keep tabs; replace other control bytes without changing match offsets.
     return (value:gsub("%c", function(char)
@@ -178,6 +223,8 @@ function M.open(root, index_config, opts)
         or nil
     -- Metadata filters use the generated indexes, read once per picker.
     local metadata = search_index.read(root, index_config)
+    local mappings = type(index_config.search.mappings) == "table" and index_config.search.mappings or {}
+    local open_pdf_keys = M.mapping_keys(mappings.open_pdf)
 
     local snapshot = {}
     local picker = pickers.new(opts, {
@@ -186,6 +233,12 @@ function M.open(root, index_config, opts)
         results_title = "Workspace notes",
         sorting_strategy = "ascending",
         previewer = previewer(config, opts),
+        attach_mappings = function(_, map)
+            for mode, key in pairs(open_pdf_keys) do
+                map(mode, key, M.actions.open_pdf, { desc = "Open the PDF of the literature" })
+            end
+            return true
+        end,
         finder = finders.new_dynamic({
             fn = function(prompt)
                 local groups = query.parse(prompt)

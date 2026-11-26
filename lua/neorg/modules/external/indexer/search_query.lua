@@ -1,3 +1,5 @@
+local indexers = require("neorg.modules.external.indexer.indexers")
+
 local M = {}
 
 -- Supported fields. Metadata fields map to the canonical key of the index they
@@ -11,7 +13,27 @@ local fields = {
     categories = "categories",
     created = "created",
     updated = "updated",
+    keywords = "bibtex.keyword",
 }
+
+-- Display names of metadata matches whose index key is not a user-facing name.
+local labels = {}
+
+-- Index keys whose values are dates.
+local timestamps = { created = true, updated = true }
+
+-- Every BibTeX field indexer has a `bibtex_<field>:` filter and, unless the name is ambiguous with
+-- a note property, a short alias.
+local no_alias = { key = true, type = true }
+for _, field in ipairs(indexers.bibtex_fields) do
+    local key = "bibtex." .. field.name
+    fields["bibtex_" .. field.name] = key
+    if not no_alias[field.name] then
+        fields[field.name] = key
+    end
+    labels[key] = field.label or field.name
+    timestamps[key] = field.date
+end
 
 local function normalize_date_separators(value)
     return (value:gsub("(%d)/%f[%d]", "%1-"))
@@ -73,7 +95,7 @@ function M.parse(prompt)
                 return nil
             end
 
-            local timestamp = key == "created" or key == "updated"
+            local timestamp = timestamps[key] == true
             if timestamp then
                 value = normalize_date_separators(value)
             end
@@ -143,7 +165,7 @@ local function match_term(note, term, search_content)
         return #matches > 0 and matches or nil
     elseif field then
         for _, text in ipairs(note.metadata[field] or {}) do
-            local match = hit(text, term, "metadata", field)
+            local match = hit(text, term, "metadata", labels[field] or field)
             if match then
                 return { match }
             end

@@ -1,13 +1,14 @@
 --[[
     file: module.lua
     title: Indexer Module for Neorg
-    description: Index Neorg documents by category, author, and date
+    description: Index Neorg documents by category, author, date, and BibTeX keyword
     author: neorg-indexer
 --]]
 
 local neorg = require("neorg.core")
 local modules, utils = neorg.modules, neorg.utils
 local indexers = require("neorg.modules.external.indexer.indexers")
+local bibtex = require("neorg.modules.external.indexer.bibtex")
 
 local module = modules.create("external.indexer")
 
@@ -55,11 +56,15 @@ module.config.public = {
     search = {
         search_content = true,
         include_generated = false,
+        mappings = {
+            open_pdf = "<C-o>",
+        },
     },
     categories = vim.deepcopy(indexers.defaults.categories),
     authors = vim.deepcopy(indexers.defaults.authors),
     created = vim.deepcopy(indexers.defaults.created),
     updated = vim.deepcopy(indexers.defaults.updated),
+    bibtex = vim.deepcopy(indexers.defaults.bibtex),
 }
 
 ---@class external.indexer
@@ -135,29 +140,36 @@ module.public = {
         local active = module.private.get_active_indexers(ws_norm)
         local generated_dirs = indexers.marked_dirs(module.config.public, ws_norm)
 
-        -- Collect entries from all norg files
+        -- Collect entries from all norg and bib files
         local entries = module.private.collect_entries(
-            module.private.list_norg_files(ws_norm),
+            module.private.list_source_files(ws_norm),
             { ws_norm, ws_real },
             index_rel,
             generated_dirs
         )
+        module.private.pdf_bibs[ws_norm] = module.private.build_pdf_bibs(entries)
 
-        local changed_norgnames = {}
+        local changed_targets = {}
         if changed_set then
+            -- A changed PDF changes the literatures whose `file` field resolves to it, whether the
+            -- PDF was created or deleted.
+            local pdf_bibs = module.private.pdf_bibs[ws_norm] or {}
+            for path in pairs(vim.deepcopy(changed_set)) do
+                if path:lower():match("%.pdf$") then
+                    for _, bib in ipairs(pdf_bibs[path] or {}) do
+                        changed_set[bib] = true
+                    end
+                end
+            end
             local seen = {}
             for path in pairs(changed_set) do
                 local rel = module.private.get_relative_path(path, { ws_norm, ws_real })
-                if
-                    rel
-                    and rel:match("%.norg$")
+                local target = rel
                     and not module.private.is_generated_path(rel, index_rel, generated_dirs)
-                then
-                    local norgname = module.private.get_norgname(rel)
-                    if not seen[norgname] then
-                        seen[norgname] = true
-                        table.insert(changed_norgnames, norgname)
-                    end
+                    and module.private.get_link_target(rel)
+                if target and not seen[target.norgname] then
+                    seen[target.norgname] = true
+                    table.insert(changed_targets, target)
                 end
             end
         end
@@ -181,13 +193,16 @@ module.public = {
                         .. ") exists, is not empty, and has no "
                         .. indexers.marker
                         .. " marker file; skipping the "
-                        .. ix.def.title
+                        .. indexers.full_title(ix.def)
                         .. " index",
                     vim.log.levels.ERROR
                 )
                 goto continue
             end
-            table.insert(sections, module.private.generate_section_lines(ix, tree, index_rel))
+            local section = module.private.generate_section_lines(ix, tree, index_rel)
+            if section then
+                table.insert(sections, { group = ix.def.group, lines = section })
+            end
 
             if ix.per_file then
                 -- Partial updates need an existing generated index directory to patch. Name collisions
@@ -199,7 +214,7 @@ module.public = {
                     and not tree.has_collisions
                     and not module.private.has_collision_suffix(ix.dir_abs)
                 then
-                    affected = module.private.find_affected_buckets(ix, entries, changed_set, changed_norgnames)
+                    affected = module.private.find_affected_buckets(ix, entries, changed_set, changed_targets)
                 end
 
                 -- Prepare content with metadata handling (BEFORE deleting index directories)
@@ -235,11 +250,18 @@ module.public = {
 
         local files_to_write = {}
 
-        -- Main index: skip the write when nothing would change.
+        -- Main index: skip the write when nothing would change. The "* Index" heading is kept
+        -- even when no indexer has a section. Grouped sections are level-3 headings under one
+        -- level-2 group heading, which exists only when one of its sections does.
         local main_lines = { "* Index" }
+        local group
         for _, section in ipairs(sections) do
             table.insert(main_lines, "")
-            vim.list_extend(main_lines, section)
+            if section.group and section.group ~= group then
+                vim.list_extend(main_lines, { "** " .. section.group, "" })
+            end
+            group = section.group
+            vim.list_extend(main_lines, section.lines)
         end
         local main_body = table.concat(main_lines, "\n") .. "\n"
         local main_content = module.private.prepare_index_content(index_path, main_body, "Index")
@@ -294,6 +316,9 @@ module.public = {
 
 module.private = {
     workspace_watchers = {},
+    -- Per workspace root: PDF path (as written and resolved) -> .bib files whose `file` field
+    -- resolves to it, whether or not the PDF exists.
+    pdf_bibs = {},
     watch_timers = {},
     pending_changes = {},
     index_on_launch_pending = false,
@@ -389,12 +414,12 @@ module.private = {
         return path
     end,
 
-    --- List the .norg files of a workspace, following symlinks like `core.dirman` does.
+    --- List the .norg and .bib files of a workspace, following symlinks like `core.dirman` does.
     --- Unlike `core.dirman.get_norg_files`, paths are not resolved: a symlinked note or directory
     --- keeps its path inside the workspace.
     --- @param ws_root string normalized absolute workspace root
     --- @return string[] normalized absolute file paths
-    list_norg_files = function(ws_root)
+    list_source_files = function(ws_root)
         local files = {}
         -- Real paths of the directories on the current walk, to avoid symlink cycles.
         local ancestors = {}
@@ -417,7 +442,7 @@ module.private = {
                 end
                 if kind == "directory" then
                     walk(path, depth + 1)
-                elseif kind == "file" and name:sub(-5) == ".norg" then
+                elseif kind == "file" and (name:sub(-5) == ".norg" or name:sub(-4) == ".bib") then
                     table.insert(files, path)
                 end
             end
@@ -454,7 +479,7 @@ module.private = {
                 end
                 if ix.error then
                     module.private.notify_once(
-                        "external.indexer: " .. ix.error .. "; skipping the " .. ix.def.title .. " index",
+                        "external.indexer: " .. ix.error .. "; skipping the " .. indexers.full_title(ix.def) .. " index",
                         vim.log.levels.ERROR
                     )
                 else
@@ -579,7 +604,7 @@ module.private = {
         end)
     end,
 
-    --- Setup filesystem watchers for all workspaces to track .norg changes.
+    --- Setup filesystem watchers for all workspaces to track .norg, .bib, and .pdf changes.
     setup_workspace_watchers = function()
         local dirman = module.required["core.dirman"]
         if not dirman then
@@ -604,7 +629,12 @@ module.private = {
                                 return
                             end
                             local abs_path = vim.fs.normalize(vim.fs.abspath(ws_root .. "/" .. filename))
-                            if not abs_path:match("%.norg$") then
+                            local lower = abs_path:lower()
+                            if
+                                not abs_path:match("%.norg$")
+                                and not abs_path:match("%.bib$")
+                                and not lower:match("%.pdf$")
+                            then
                                 return
                             end
                             if module.private.should_ignore_path(abs_path, ws_root) then
@@ -726,6 +756,57 @@ module.private = {
         return "/" .. rel:gsub("%.norg$", "")
     end,
 
+    --- Link target of an indexed file: a note ({:$/path:}) or a literature ({/ path.bib}).
+    --- @param rel string normalized file path relative to the workspace root
+    --- @return table|nil { kind, rel, norgname } where norgname identifies the entry
+    get_link_target = function(rel)
+        if rel:match("%.norg$") then
+            return { kind = "note", rel = rel, norgname = module.private.get_norgname(rel) }
+        elseif rel:match("%.bib$") then
+            return { kind = "literature", rel = rel, norgname = "/" .. rel }
+        end
+        return nil
+    end,
+
+    --- Link location of a file in a `{/ ...}` link written in another workspace file.
+    --- Neorg does not expand `$` in file links: relative paths are resolved from the directory of
+    --- the file that contains the link.
+    --- @param host_rel string path of the file containing the link, relative to the workspace root
+    --- @param to_rel string path of the linked file, relative to the workspace root
+    --- @return string
+    get_file_link = function(host_rel, to_rel)
+        local from_dir = vim.fn.fnamemodify(host_rel, ":h")
+        local from_parts = (from_dir == "." or from_dir == "") and {} or vim.split(from_dir, "/", { plain = true })
+        local to_parts = vim.split(to_rel, "/", { plain = true })
+        local common = 0
+        -- Only directories are shared; the last part of to_rel is the file name.
+        while common < #from_parts and common < #to_parts - 1 and from_parts[common + 1] == to_parts[common + 1] do
+            common = common + 1
+        end
+        local parts = {}
+        for _ = common + 1, #from_parts do
+            table.insert(parts, "..")
+        end
+        vim.list_extend(parts, to_parts, common + 1)
+        local link = table.concat(parts, "/")
+        -- A leading "~" would be read as the home directory.
+        if link:sub(1, 1) == "~" then
+            link = "./" .. link
+        end
+        return link
+    end,
+
+    --- Text that identifies a link to a target in a generated file.
+    --- @param target table from get_link_target (or an entry)
+    --- @param host_rel string path of the generated file, relative to the workspace root
+    --- @return string
+    get_link_token = function(target, host_rel)
+        if target.kind == "literature" then
+            return "{/ " .. module.private.get_file_link(host_rel, target.rel) .. "}"
+        end
+        return "{:$" .. target.norgname .. ":}"
+    end,
+
     --- Escape text for a Norg heading or link description.
     --- @param text string
     --- @return string
@@ -750,6 +831,7 @@ module.private = {
     collect_entries = function(files, roots, index_rel, skip_dirs)
         local ts = module.required["core.integrations.treesitter"]
         local entries = {}
+        local bib_available = nil
 
         for _, file in ipairs(files) do
             local abs_path = vim.fs.normalize(vim.fs.abspath(tostring(file)))
@@ -757,6 +839,22 @@ module.private = {
 
             -- Skip files outside the workspace, the main index file, and generated index directories
             if not rel or module.private.is_generated_path(rel, index_rel, skip_dirs) then
+                goto continue
+            end
+
+            if rel:match("%.bib$") then
+                if bib_available == nil then
+                    bib_available = bibtex.available()
+                    if not bib_available then
+                        bibtex.warn_unavailable(utils.notify)
+                    end
+                end
+                if bib_available then
+                    local entry = module.private.collect_literature(abs_path, rel)
+                    if entry then
+                        table.insert(entries, entry)
+                    end
+                end
                 goto continue
             end
 
@@ -791,7 +889,9 @@ module.private = {
             norm_meta.title = title -- ensure resolved title is available
 
             table.insert(entries, {
+                kind = "note",
                 abs_path = abs_path,
+                rel = rel,
                 title = title,
                 norgname = module.private.get_norgname(rel),
                 description = description,
@@ -806,17 +906,87 @@ module.private = {
         return entries
     end,
 
+    --- Read the literature entry of a .bib file: its first BibTeX entry.
+    --- @param abs_path string normalized absolute path
+    --- @param rel string path relative to the workspace root
+    --- @return table|nil entry, nil when the file has no entry
+    collect_literature = function(abs_path, rel)
+        local source = module.private.read_file_contents(abs_path)
+        if not source then
+            return nil
+        end
+        local item = bibtex.read(source, abs_path)
+        if not item then
+            return nil
+        end
+        if item.extra > 0 then
+            module.private.notify_once(
+                "external.indexer: "
+                    .. rel
+                    .. " contains "
+                    .. (item.extra + 1)
+                    .. " BibTeX entries; only the first one ("
+                    .. item.citekey
+                    .. ") is indexed",
+                vim.log.levels.WARN
+            )
+        end
+        local metadata = item.metadata
+        return {
+            kind = "literature",
+            abs_path = abs_path,
+            rel = rel,
+            title = metadata.title,
+            norgname = "/" .. rel,
+            citekey = item.citekey,
+            pdf = item.pdf,
+            pdf_candidates = item.pdf_candidates,
+            description = metadata.description,
+            created = metadata.created,
+            updated = metadata.updated,
+            metadata = metadata,
+        }
+    end,
+
+    --- Map PDF paths named by literatures' `file` fields to the .bib files that name them.
+    --- @param entries table[]
+    --- @return table<string, string[]>
+    build_pdf_bibs = function(entries)
+        local result = {}
+        local function add(path, bib)
+            result[path] = result[path] or {}
+            if not vim.tbl_contains(result[path], bib) then
+                table.insert(result[path], bib)
+            end
+        end
+        for _, entry in ipairs(entries) do
+            for _, path in ipairs(entry.pdf_candidates or {}) do
+                add(path, entry.abs_path)
+                add(module.private.real_path(path), entry.abs_path)
+            end
+        end
+        return result
+    end,
+
     --- Return the bucket paths of an entry for an indexer, using the fallback bucket when empty.
+    --- Literatures use `literature_fallback` instead of `fallback` when the indexer has one.
     --- @param ix table active indexer
     --- @param entry table
     --- @return string[][] bucket paths (lists of raw parts)
     --- @return boolean is_fallback
     get_bucket_paths = function(ix, entry)
+        if ix.def.literature_only and entry.kind ~= "literature" then
+            return {}, false
+        end
         local paths = ix.def.values(entry.metadata, ix.config)
         if #paths > 0 then
             return paths, false
         end
         local fallback = ix.config.fallback
+        local literature_fallback = ix.config.literature_fallback
+        if entry.kind == "literature" and literature_fallback and literature_fallback ~= "" then
+            fallback = literature_fallback
+        end
         if fallback == nil or fallback == false or fallback == "" then
             return {}, false
         end
@@ -935,13 +1105,13 @@ module.private = {
         return keys
     end,
 
-    --- Find buckets whose index files currently reference any of the given note norgnames.
+    --- Find buckets whose index files currently link to any of the given notes or literatures.
     --- @param ix table active indexer
-    --- @param norgnames string[]
+    --- @param targets table[] link targets from get_link_target
     --- @return table map of bucket keys -> true
-    find_buckets_for_norgnames = function(ix, norgnames)
+    find_buckets_for_targets = function(ix, targets)
         local results = {}
-        if #norgnames == 0 or vim.fn.isdirectory(ix.dir_abs) ~= 1 then
+        if #targets == 0 or vim.fn.isdirectory(ix.dir_abs) ~= 1 then
             return results
         end
         local files = vim.fs.find(function(name, _)
@@ -950,9 +1120,10 @@ module.private = {
         for _, abs_path in ipairs(files) do
             local content = module.private.read_file_contents(abs_path)
             if content then
-                for _, norgname in ipairs(norgnames) do
-                    if content:find("{:$" .. norgname .. ":}", 1, true) then
-                        local key = vim.fs.normalize(abs_path):sub(#ix.dir_abs + 2):gsub("%.norg$", "")
+                local key = vim.fs.normalize(abs_path):sub(#ix.dir_abs + 2):gsub("%.norg$", "")
+                local host_rel = ix.dir .. "/" .. key .. ".norg"
+                for _, target in ipairs(targets) do
+                    if content:find(module.private.get_link_token(target, host_rel), 1, true) then
                         results[key] = true
                         break
                     end
@@ -966,9 +1137,9 @@ module.private = {
     --- @param ix table active indexer
     --- @param entries table[]
     --- @param changed_set table map of normalized absolute file paths that changed
-    --- @param changed_norgnames string[] norgnames of changed notes
+    --- @param changed_targets table[] link targets of changed notes and literatures
     --- @return table map of bucket keys -> true
-    find_affected_buckets = function(ix, entries, changed_set, changed_norgnames)
+    find_affected_buckets = function(ix, entries, changed_set, changed_targets)
         local affected = {}
         for _, entry in ipairs(entries) do
             if changed_set[entry.abs_path] or changed_set[module.private.real_path(entry.abs_path)] then
@@ -982,7 +1153,7 @@ module.private = {
             end
         end
         -- Keys of existing files are file paths: encoded names never contain "/".
-        for key in pairs(module.private.find_buckets_for_norgnames(ix, changed_norgnames)) do
+        for key in pairs(module.private.find_buckets_for_targets(ix, changed_targets)) do
             local acc = {}
             for _, name in ipairs(vim.split(key, "/", { plain = true })) do
                 table.insert(acc, name)
@@ -1076,13 +1247,49 @@ module.private = {
         return rel
     end,
 
-    --- Format a list of entries as heading link lines.
-    format_entry_lines = function(ix, entries, heading_level)
+    --- Format a list of entries as heading link lines (list items beyond the deepest heading level).
+    --- Notes link to `{:$/path:}`. Literatures link to their .bib file with a path relative to the
+    --- generated file, with a `[citekey]` prefix and a trailing `[PDF]` link to the PDF when there is
+    --- one. Both brackets of the prefix and of `[PDF]` are escaped so that they display literally.
+    --- @param ix table active indexer
+    --- @param entries table[]
+    --- @param heading_level integer
+    --- @param host_rel string path of the generated file, relative to the workspace root
+    --- @return string[]
+    format_entry_lines = function(ix, entries, heading_level, host_rel)
         local title_formatter = ix.config.title_formatter or default_title_formatter
+        local escape = module.private.escape
         local lines = {}
         for _, entry in ipairs(entries) do
-            local display_title = module.private.escape(tostring(title_formatter(entry.metadata)))
-            local line = string.rep("*", heading_level) .. " {:$" .. entry.norgname .. ":}[" .. display_title .. "]"
+            local display_title = escape(tostring(title_formatter(entry.metadata)))
+            local line
+            if entry.kind == "literature" then
+                line = indexers.heading_prefix(heading_level)
+                    .. " "
+                    .. module.private.get_link_token(entry, host_rel)
+                    .. "[\\["
+                    .. escape(entry.citekey)
+                    .. "\\] "
+                    .. display_title
+                    .. "]"
+                if entry.pdf then
+                    local pdf_rel = module.private.get_relative_path(entry.pdf, {
+                        entry.abs_path:sub(1, #entry.abs_path - #entry.rel - 1),
+                    })
+                    if pdf_rel then
+                        line = line .. " {/ " .. module.private.get_file_link(host_rel, pdf_rel) .. "}[\\[PDF\\]]"
+                    else
+                        line = line .. " {/ " .. entry.pdf .. "}[\\[PDF\\]]"
+                    end
+                end
+            else
+                line = indexers.heading_prefix(heading_level)
+                    .. " {:$"
+                    .. entry.norgname
+                    .. ":}["
+                    .. display_title
+                    .. "]"
+            end
             table.insert(lines, line)
         end
         return lines
@@ -1168,14 +1375,19 @@ module.private = {
 
     --- Generate the lines of an indexer's section in the main index.
     --- In per-file mode, top-level buckets become headings that link to their index files.
+    --- An indexer without buckets has no section. A grouped indexer's section is one level deeper.
     --- @param ix table active indexer
     --- @param tree table
     --- @param index_rel string main index path relative to the workspace root
-    --- @return string[]
+    --- @return string[]|nil nil when the tree has no buckets
     generate_section_lines = function(ix, tree, index_rel)
-        local lines = { "** " .. ix.def.title }
+        if not module.private.has_children(tree) then
+            return nil
+        end
+        local level = ix.def.group and 3 or 2
+        local lines = { string.rep("*", level) .. " " .. ix.def.title }
         if not ix.per_file then
-            vim.list_extend(lines, module.private.generate_tree_lines(ix, tree, {}, 3))
+            vim.list_extend(lines, module.private.generate_tree_lines(ix, tree, {}, level + 1, index_rel))
             return lines
         end
 
@@ -1183,15 +1395,15 @@ module.private = {
             local rel_path = module.private.get_bucket_rel_path(ix, { child_name })
             local rel_norgname = module.private.get_relative_norgname(index_rel, rel_path)
             local label = module.private.get_bucket_label(ix, { child_name })
-            table.insert(lines, "*** {:" .. rel_norgname .. ":}[" .. label .. "]")
+            table.insert(lines, string.rep("*", level + 1) .. " {:" .. rel_norgname .. ":}[" .. label .. "]")
         end
 
         if ix.list_notes then
             -- "Notes" heading with all descendant entries flattened
             local all_entries = module.private.prepare_entries(ix, module.private.collect_all_entries(tree))
             if #all_entries > 0 then
-                table.insert(lines, "*** Notes")
-                vim.list_extend(lines, module.private.format_entry_lines(ix, all_entries, 4))
+                table.insert(lines, string.rep("*", level + 1) .. " Notes")
+                vim.list_extend(lines, module.private.format_entry_lines(ix, all_entries, level + 2, index_rel))
             end
         end
 
@@ -1200,8 +1412,10 @@ module.private = {
 
     --- Generate tree lines for inline mode (per-file index disabled).
     --- Recursively generate the full bucket tree with notes listed under
-    --- their corresponding bucket (not flattened). No "Notes" heading.
-    generate_tree_lines = function(ix, node, path_parts, heading_level)
+    --- their corresponding bucket (not flattened). No "Notes" heading. Levels deeper than Norg
+    --- headings allow become nested list items (see indexers.heading_prefix).
+    --- `host_rel` is the path of the file that contains the lines, relative to the workspace root.
+    generate_tree_lines = function(ix, node, path_parts, heading_level, host_rel)
         local result = {}
         for _, child_name in ipairs(module.private.sort_children(ix, node)) do
             local child = node.children[child_name]
@@ -1211,18 +1425,18 @@ module.private = {
             -- Bucket heading
             table.insert(
                 result,
-                string.rep("*", heading_level) .. " " .. module.private.get_bucket_label(ix, child_path_parts)
+                indexers.heading_prefix(heading_level) .. " " .. module.private.get_bucket_label(ix, child_path_parts)
             )
 
             -- Direct entries of this bucket
             local entries = module.private.prepare_entries(ix, vim.list_extend({}, child.entries))
-            vim.list_extend(result, module.private.format_entry_lines(ix, entries, heading_level + 1))
+            vim.list_extend(result, module.private.format_entry_lines(ix, entries, heading_level + 1, host_rel))
 
             -- Recurse into sub-buckets
             if module.private.has_children(child) then
                 vim.list_extend(
                     result,
-                    module.private.generate_tree_lines(ix, child, child_path_parts, heading_level + 1)
+                    module.private.generate_tree_lines(ix, child, child_path_parts, heading_level + 1, host_rel)
                 )
             end
         end
@@ -1294,12 +1508,15 @@ module.private = {
                 local all_entries = module.private.prepare_entries(ix, module.private.collect_all_entries(node))
                 if #all_entries > 0 then
                     vim.list_extend(lines, { "", string.rep("*", heading_level) .. " Notes", "" })
-                    vim.list_extend(lines, module.private.format_entry_lines(ix, all_entries, heading_level + 1))
+                    vim.list_extend(
+                        lines,
+                        module.private.format_entry_lines(ix, all_entries, heading_level + 1, rel_path)
+                    )
                 end
             else
                 -- Only direct entries, then child headings, then the parent link as the last heading
                 local entries = module.private.prepare_entries(ix, vim.list_extend({}, node.entries))
-                vim.list_extend(lines, module.private.format_entry_lines(ix, entries, heading_level + 1))
+                vim.list_extend(lines, module.private.format_entry_lines(ix, entries, heading_level + 1, rel_path))
                 vim.list_extend(lines, heading_lines)
                 table.insert(lines, parent_link_line)
             end

@@ -51,10 +51,16 @@ local function read_lines(path)
     return lines
 end
 
+--- Level and text of a generated heading. List items stand for levels deeper than the deepest
+--- heading level (see indexers.heading_prefix).
 local function parse_heading(line)
     local stars, heading = line:match("^%s*(%*+)%s+(.-)%s*$")
     if stars then
         return #stars, heading
+    end
+    local dashes, item = line:match("^%s*(%-+)%s+(.-)%s*$")
+    if dashes then
+        return indexers.max_heading_level + #dashes, item
     end
 end
 
@@ -63,10 +69,39 @@ local function unescape(text)
     return (text:gsub("\\(.)", "%1"))
 end
 
--- Workspace links ({:$/path:}) point to notes; relative links are navigation.
-local function note_path(heading)
+--- Resolve a link location relative to the directory of a workspace file.
+--- @return string|nil workspace-relative path, nil when it leaves the workspace
+local function resolve(host_rel, location)
+    if location:match("^[/~]") then
+        return nil
+    end
+    local parts = vim.split(host_rel, "/", { plain = true })
+    parts[#parts] = nil
+    for _, part in ipairs(vim.split(location, "/", { plain = true })) do
+        if part == ".." then
+            if #parts == 0 then
+                return nil
+            end
+            parts[#parts] = nil
+        elseif part ~= "." and part ~= "" then
+            parts[#parts + 1] = part
+        end
+    end
+    return table.concat(parts, "/")
+end
+
+-- Workspace links ({:$/path:}) point to notes and file links to .bib files ({/ path.bib}, relative
+-- to the generated file) point to literatures; relative Norg links are navigation.
+local function note_path(heading, host_rel)
     local target = heading:match("{:%$/(.-):}")
-    return target and target .. ".norg"
+    if target then
+        return target .. ".norg"
+    end
+    local location = heading:match("^{/ (.-)}%[")
+    if location and location:match("%.bib$") then
+        return resolve(host_rel, location)
+    end
+    return nil
 end
 
 --- Collect bucket values per note for one indexer.
@@ -90,7 +125,7 @@ local function read_per_file(root, ix)
                         if value == nil then
                             value = ix.def.file_value(path_parts, unescape(heading), ix.config)
                         end
-                        local path = note_path(heading)
+                        local path = note_path(heading, ix.dir .. "/" .. name)
                         if path and value then
                             result[path] = result[path] or {}
                             table.insert(result[path], value)
@@ -111,16 +146,27 @@ local function read_inline(root, config, ix)
     if not lines then
         return result
     end
+    -- Titles of the headings that lead to the section: the group heading, if any, then the section.
+    local titles = ix.def.group and { ix.def.group, ix.def.title } or { ix.def.title }
+    local base = #titles + 1
+    local open = {}
     local in_section = false
     local stack = {}
     for _, line in ipairs(lines) do
         local level, heading = parse_heading(line)
-        if level and level <= 2 then
-            in_section = level == 2 and heading == ix.def.title
+        if level and level <= base then
+            open[level] = heading
+            for i = level + 1, base do
+                open[i] = nil
+            end
+            in_section = level == base
+            for i, title in ipairs(titles) do
+                in_section = in_section and open[i + 1] == title
+            end
             stack = {}
         elseif level and in_section then
-            local path = note_path(heading)
-            local depth = level - 2
+            local path = note_path(heading, vim.fs.normalize(config.name))
+            local depth = level - base
             if path then
                 -- An entry belongs to the bucket one level above it.
                 local labels = vim.list_slice(stack, 1, depth - 1)
