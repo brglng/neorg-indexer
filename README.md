@@ -360,8 +360,29 @@ Set these options under `load["external.indexer"].config` in your Neorg setup.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | string | `"index.norg"` | Name of the main index file, relative to the workspace root. |
-| `index_on_launch` | boolean | `false` | When `true`, generate indexes when the module is loaded. |
+| `index_on_launch` | boolean | `false` | When `true`, generate indexes for the active named workspace when the module loads. |
 | `index_on_change` | boolean | `true` | When `true`, regenerate indexes when workspace `.norg` or `.bib` files (or the PDFs of literatures) change. |
+
+To index at startup, set `default_workspace` in `core.dirman` to the name of a
+configured workspace. Add these entries to your Neorg `load` table, replacing
+`notes` and `~/notes` with your workspace name and path:
+
+```lua
+["core.dirman"] = {
+    config = {
+        workspaces = { notes = "~/notes" },
+        default_workspace = "notes",
+    },
+},
+["external.indexer"] = {
+    config = { index_on_launch = true },
+},
+```
+
+If Neorg starts in its built-in `default` workspace (the working directory),
+launch indexing waits until you enter a named workspace, for example with
+`:Neorg workspace notes`. It does not index the working directory or inactive
+workspaces.
 
 `categories.name`, `categories.index_on_launch`, and `categories.index_on_change`
 were moved to the top level. The old keys are ignored with a warning.

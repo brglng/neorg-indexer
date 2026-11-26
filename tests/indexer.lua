@@ -91,10 +91,11 @@ local function run()
     require("neorg").setup({
         load = {
             ["core.neorgcmd"] = {},
-            ["core.dirman"] = { config = { workspaces = { notes = ws, extra = ws2 } } },
+            ["core.dirman"] = { config = { workspaces = { notes = ws, extra = ws2 }, default_workspace = "notes" } },
             ["core.integrations.treesitter"] = { config = { configure_parsers = false } },
             ["external.indexer"] = {
                 config = {
+                    index_on_launch = true,
                     index_on_change = false,
                     -- Removed option: warned about and ignored.
                     categories = { name = "old.norg" },
@@ -149,8 +150,11 @@ local function run()
         return before
     end
 
-    -- Full index with default options.
-    index()
+    -- Launch indexing runs with change indexing disabled and only targets the active workspace.
+    await("launch index generation", function()
+        return count(nil, "Index generated at " .. ws .. "/index.norg") == 1
+    end)
+    assert(vim.fn.filereadable(ws2 .. "/index.norg") == 0)
     assert(not read("old.norg"))
     assert(vim.deep_equal(section("Categories"), {
         "*** {:index/categories/a:}[a]",
