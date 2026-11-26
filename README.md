@@ -1,7 +1,22 @@
 # neorg-indexer
 
-Automatic category index generation and optional Telescope note search for Neorg,
-with BibTeX literatures indexed alongside notes.
+Index and search your Neorg notes and BibTeX literatures by category, author,
+and date.
+
+## Features
+
+- **Automatic indexes**: generate Neorg index files grouped by category,
+  author, created date, and updated date, kept up to date as files change.
+- **No database**: indexes are plain `.norg` files in your workspace, readable
+  and navigable like any other note; search reads them directly.
+- **BibTeX literatures**: index `.bib` files alongside notes, with links to
+  their PDFs and extra indexes for keywords, journals, publishers, and more.
+- **Live search**: find notes and literatures with a Telescope picker, using
+  plain terms, phrases, `|` (OR), `-` (NOT), and metadata filters such as
+  `author:` or `created:2025-03`.
+- **Open PDFs**: open a literature's PDF with your system's default
+  application right from the picker, and preview its first page with
+  [image.nvim](https://github.com/3rd/image.nvim).
 
 ## Installation
 
