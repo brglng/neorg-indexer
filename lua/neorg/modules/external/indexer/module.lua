@@ -1628,8 +1628,8 @@ module.private = {
     --- The indexer follows the metagen module's type and update_date settings.
     --- @return table metagen configuration
     get_metagen_config = function()
-        local metagen = module.required["core.esupports.metagen"]
-        return metagen.config and metagen.config.public or {}
+        -- `module.required[...]` only exposes the public API, not the config.
+        return modules.get_module_config("core.esupports.metagen") or {}
     end,
 
     --- Whether metadata should be created for an index file.

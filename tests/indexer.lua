@@ -336,6 +336,21 @@ local function run()
     config.bibtex = bibtex_config
     index()
     assert(section("Authors") and section("Created") and section("Updated"))
+    -- Generated files follow core.esupports.metagen: no metadata for "none", metadata on top for "auto".
+    do
+        local metagen_config = modules.get_module_config("core.esupports.metagen")
+        assert(metagen_config.type == "none")
+        assert(read("index.norg")[1] ~= "@document.meta", vim.inspect(read("index.norg")))
+        metagen_config.type = "auto"
+        index()
+        for _, rel in ipairs({ "index.norg", "index/authors/Ada Lovelace.norg" }) do
+            local lines = read(rel)
+            assert(lines and lines[1] == "@document.meta", rel .. ": " .. vim.inspect(lines))
+            assert(vim.tbl_contains(lines, "@end"), rel)
+        end
+        assert(section("Authors") and section("Created") and section("Updated"))
+        metagen_config.type = "none"
+    end
     -- The disabled indexer's marked directory is excluded from search and from the watcher.
     assert(vim.tbl_contains(search_index.generated_paths(config, ws), "index/categories"))
     assert(not vim.tbl_contains(search_index.generated_paths(config), "index/categories"))
