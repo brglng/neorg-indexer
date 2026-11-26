@@ -337,6 +337,9 @@ local function pdf_preview_tests()
         local none, message = pdf_preview.show(image, png, win, buf)
         assert(none == nil and message:find("not setup", 1, true))
         assert(pdf_preview.available() == nil)
+        -- Closing the picker does not forget it.
+        pdf_preview.forget_errors()
+        assert(pdf_preview.available() == nil)
         local notified = {}
         local notify = vim.notify
         vim.notify = function(text, level)

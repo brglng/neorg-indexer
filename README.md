@@ -350,7 +350,9 @@ ImageMagick (`magick`, or `convert` of ImageMagick 6) with Ghostscript is
 available (see `search.pdf_preview`); otherwise it shows the literature's `.bib`
 file. The page is rendered in the background and cached under
 `stdpath("cache")/neorg-indexer/pdf-preview/`; a failed rendering is not cached
-and is retried the next time the entry is previewed. Other
+and is retried the next time the entry is previewed. A failed rendering is
+reported once per picker. When image.nvim is not set up or ImageMagick is
+missing, previews stay off until Neovim restarts. Other
 Telescope actions that use the entry's file, such as sending results to the
 quickfix list, use the `.bib` file. Press `<C-o>` (insert and normal mode, see
 `search.mappings.open_pdf`) on a literature or a PDF entry to open the PDF with

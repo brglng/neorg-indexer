@@ -419,6 +419,21 @@ local function run()
     assert(#warnings == 1 and warnings[1][1]:find("no Ghostscript", 1, true), vim.inspect(warnings))
     assert(#conversions == 2 and #images == 2)
     actions.close(picker.prompt_bufnr)
+    -- Closing the picker forgets the failure: the next picker converts again and warns again.
+    vim.notify = function(message, level)
+        warnings[#warnings + 1] = { message, level }
+    end
+    picker = assert(indexer.search())
+    await_rows("title:lit2020", { { nil, bib_row }, { nil, pdf_row } })
+    picker:set_selection(1)
+    assert(vim.wait(2000, function()
+        return #conversions == 3
+    end))
+    conversions[3](1)
+    preview_lines(bib_lines)
+    vim.notify = notify
+    assert(#warnings == 2 and warnings[2][1]:find("no Ghostscript", 1, true), vim.inspect(warnings))
+    actions.close(picker.prompt_bufnr)
     vim.system, pdf_preview.converter, pdf_preview.cache_dir = system, converter, cache_dir
     package.loaded.image = nil
     pdf_preview.reset()

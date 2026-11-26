@@ -87,13 +87,20 @@ function M.available()
     end
 end
 
---- Report the first preview failure of the session.
+--- Report the first preview failure of a picker.
 --- @param err any
 function M.warn(err)
     if not warned then
         warned = true
         vim.notify("Neorg indexer: cannot preview PDF, showing text instead: " .. tostring(err), vim.log.levels.WARN)
     end
+end
+
+--- Forget the reported warning when a picker closes, so the next picker reports a failed
+--- rendering again. Renderings are retried anyway, since they are never cached; image.nvim
+--- being unusable and a missing ImageMagick stay remembered for the session.
+function M.forget_errors()
+    warned = false
 end
 
 --- Rasterize the first page of a PDF asynchronously, reusing the cache.

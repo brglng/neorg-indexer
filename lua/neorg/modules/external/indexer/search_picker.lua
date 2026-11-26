@@ -292,6 +292,8 @@ local function previewer(config, opts, pdf_options)
             return { ready = {}, pdf = {} }
         end,
         teardown = function(self)
+            -- The next picker retries failed renderings, and reports them again.
+            pdf_preview.forget_errors()
             -- Telescope may tear down a previewer that was never set up.
             local state = self.state
             if not state then
