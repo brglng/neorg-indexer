@@ -9,6 +9,7 @@ local neorg = require("neorg.core")
 local modules, utils = neorg.modules, neorg.utils
 local indexers = require("neorg.modules.external.indexer.indexers")
 local bibtex = require("neorg.modules.external.indexer.bibtex")
+local progress = require("neorg.modules.external.indexer.progress")
 
 local module = modules.create("external.indexer")
 
@@ -53,6 +54,12 @@ module.config.public = {
     name = "index.norg",
     index_on_launch = false,
     index_on_change = true,
+    -- Progress notification while generating indexes. It appears once a run takes longer than
+    -- `delay_ms`; with `enabled = false` only the final message is shown.
+    progress = {
+        enabled = true,
+        delay_ms = 300,
+    },
     search = {
         search_content = true,
         include_generated = false,
@@ -90,14 +97,20 @@ module.public = {
         )
     end,
 
-    --- Generate the indexes for a workspace.
+    --- Generate the indexes for a workspace. Files are read and written asynchronously; requests
+    --- made while the workspace is being indexed are merged into one follow-up run.
     --- @param ws_name string|nil workspace name; defaults to the current workspace
-    --- @param opts table|nil options: { changed_files = string[] }
+    --- @param opts table|nil options: { changed_files = string[], on_done = fun(err: string|nil) }
+    ---   on_done is called once the run, and the follow-up run queued meanwhile, completed.
     index = function(ws_name, opts)
+        opts = opts or {}
+        local on_done = opts.on_done or function() end
         local dirman = modules.get_module("core.dirman")
 
         if not dirman then
-            utils.notify("`core.dirman` is not loaded! It is required to generate indexes", vim.log.levels.ERROR)
+            local message = "`core.dirman` is not loaded! It is required to generate indexes"
+            utils.notify(message, vim.log.levels.ERROR)
+            on_done(message)
             return
         end
 
@@ -111,46 +124,188 @@ module.public = {
 
         if not ws_name or ws_name == "default" then
             -- Don't generate an index for non-registered workspace (default is cwd)
+            on_done(nil)
             return
         end
 
         local ws_root = dirman.get_workspace(ws_name)
         if not ws_root then
+            on_done(nil)
             return
         end
 
         -- Paths are built from the workspace root as dirman reports it, so notes that are symlinks
-        -- (or live in symlinked directories) keep their in-workspace names. The resolved root is
-        -- only used to match paths reported in resolved form.
+        -- (or live in symlinked directories) keep their in-workspace names.
         local ws_norm = vim.fs.normalize(vim.fs.abspath(tostring(ws_root)))
-        local ws_real = module.private.real_path(ws_norm)
-        local index_rel = vim.fs.normalize(module.config.public.name)
-        local index_path = vim.fs.normalize(ws_norm .. "/" .. index_rel)
 
-        opts = opts or {}
-        local changed_set = nil
-        if type(opts.changed_files) == "table" then
-            changed_set = {}
-            for _, path in ipairs(opts.changed_files) do
-                local normalized = vim.fs.normalize(vim.fs.abspath(path))
-                changed_set[normalized] = true
-                changed_set[module.private.real_path(normalized)] = true
+        local run = module.private.index_runs[ws_norm]
+        if run then
+            module.private.queue_index_request(run, opts.changed_files)
+            table.insert(run.callbacks, on_done)
+            return
+        end
+        -- `progress = false` disables the bar, `progress = true` keeps the defaults.
+        local config = module.config.public.progress
+        if config == false then
+            config = { enabled = false }
+        elseif type(config) ~= "table" then
+            config = {}
+        end
+        run = {
+            ws_norm = ws_norm,
+            callbacks = { on_done },
+            errors = {},
+            progress = progress.new({
+                id = "neorg.indexer.progress." .. ws_norm,
+                enabled = config.enabled ~= false,
+                delay_ms = config.delay_ms or 300,
+            }),
+        }
+        module.private.index_runs[ws_norm] = run
+        run.progress:start()
+        module.private.run_index(run, opts.changed_files)
+    end,
+}
+
+module.private = {
+    -- In-flight index runs per workspace root. See `run_index`.
+    index_runs = {},
+    -- Maximum number of source files read at the same time.
+    read_concurrency = 32,
+    -- Number of files written by the last run per workspace root, to estimate the next run's.
+    last_write_count = {},
+
+    --- Record an index request for a workspace that is being indexed. Requests are merged: a
+    --- full request (without changed files) makes the follow-up run a full one.
+    --- @param run table in-flight run
+    --- @param changed_files string[]|nil
+    queue_index_request = function(run, changed_files)
+        if type(changed_files) ~= "table" or #changed_files == 0 then
+            run.pending = { full = true }
+        elseif not run.pending then
+            run.pending = { changed_files = vim.list_extend({}, changed_files) }
+        elseif not run.pending.full then
+            vim.list_extend(run.pending.changed_files, changed_files)
+        end
+    end,
+
+    --- Generate the indexes of a workspace, then the follow-up run queued meanwhile, if any.
+    --- The final message is shown and the callbacks are called once no run is queued.
+    --- @param run table in-flight run: { ws_norm, progress, callbacks, errors, pending }
+    --- @param changed_files string[]|nil
+    run_index = function(run, changed_files)
+        -- Paths are built from the workspace root as dirman reports it. The resolved root is only
+        -- used to match paths reported in resolved form.
+        local ws_norm = run.ws_norm
+        local index_path = nil
+
+        -- Called exactly once per run, whatever happens, so that the run is never left in flight.
+        local completed = false
+        local function complete(err)
+            if completed then
+                return
             end
-            if not next(changed_set) then
-                changed_set = nil
+            completed = true
+            if err then
+                table.insert(run.errors, err)
+            end
+            local pending = run.pending
+            if pending then
+                run.pending = nil
+                run.progress:reset()
+                module.private.run_index(run, pending.changed_files)
+                return
+            end
+            module.private.index_runs[ws_norm] = nil
+            local message = nil
+            if #run.errors > 0 then
+                message = table.concat(run.errors, "\n")
+            end
+            local ok_finish, finish_err = pcall(function()
+                if message then
+                    run.progress:finish(message, vim.log.levels.ERROR)
+                else
+                    run.progress:finish("Index generated at " .. (index_path or ws_norm))
+                end
+            end)
+            if not ok_finish then
+                pcall(utils.notify, "external.indexer: " .. tostring(finish_err), vim.log.levels.ERROR)
+            end
+            for _, callback in ipairs(run.callbacks) do
+                local ok_callback, callback_err = pcall(callback, message)
+                if not ok_callback then
+                    pcall(utils.notify, "external.indexer: " .. tostring(callback_err), vim.log.levels.ERROR)
+                end
             end
         end
 
-        local active = module.private.get_active_indexers(ws_norm)
-        local generated_dirs = indexers.marked_dirs(module.config.public, ws_norm)
+        -- The setup scans the workspace: run it in time slices so that the editor stays responsive.
+        module.private.run_sliced(function()
+            -- Paths are built from the workspace root as dirman reports it. The resolved root is
+            -- only used to match paths reported in resolved form.
+            local ws_real = module.private.real_path(ws_norm)
+            local index_rel = vim.fs.normalize(module.config.public.name)
+            index_path = vim.fs.normalize(ws_norm .. "/" .. index_rel)
+            local changed_set = nil
+            if type(changed_files) == "table" then
+                changed_set = {}
+                for _, path in ipairs(changed_files) do
+                    local normalized = vim.fs.normalize(vim.fs.abspath(path))
+                    changed_set[normalized] = true
+                    changed_set[module.private.real_path(normalized)] = true
+                end
+                if not next(changed_set) then
+                    changed_set = nil
+                end
+            end
 
-        -- Collect entries from all norg and bib files
-        local entries = module.private.collect_entries(
-            module.private.list_source_files(ws_norm),
-            { ws_norm, ws_real },
-            index_rel,
-            generated_dirs
-        )
+            local active = module.private.get_active_indexers(ws_norm)
+            local generated_dirs = indexers.marked_dirs(module.config.public, ws_norm)
+            local context = {
+                ws_norm = ws_norm,
+                ws_real = ws_real,
+                index_rel = index_rel,
+                index_path = index_path,
+                changed_set = changed_set,
+                active = active,
+                generated_dirs = generated_dirs,
+            }
+
+            -- Collect entries from all norg and bib files
+            module.private.collect_entries_async(
+                module.private.list_source_files(ws_norm),
+                { ws_norm, ws_real },
+                index_rel,
+                generated_dirs,
+                module.private.last_write_count[ws_norm],
+                run.progress,
+                function(entries, collect_err)
+                    if collect_err then
+                        complete(collect_err)
+                        return
+                    end
+                    module.private.run_sliced(function()
+                        module.private.generate_index(context, entries, run.progress, complete)
+                    end, function(slice_err)
+                        complete(tostring(slice_err))
+                    end)
+                end
+            )
+        end, function(err)
+            complete(tostring(err))
+        end)
+    end,
+
+    --- Generate and write the index files of a workspace from its collected entries.
+    --- @param context table { ws_norm, ws_real, index_rel, index_path, changed_set, active, generated_dirs }
+    --- @param entries table[] collected entries
+    --- @param progress table progress notification, advanced per written file
+    --- @param on_done fun(err: string|nil) called on the main loop once all files are written
+    generate_index = function(context, entries, progress, on_done)
+        local ws_norm, ws_real, index_rel, index_path =
+            context.ws_norm, context.ws_real, context.index_rel, context.index_path
+        local changed_set, active, generated_dirs = context.changed_set, context.active, context.generated_dirs
+
         module.private.pdf_bibs[ws_norm] = module.private.build_pdf_bibs(entries)
 
         local changed_targets = {}
@@ -226,6 +381,7 @@ module.public = {
                 local rel_paths = vim.tbl_keys(files)
                 table.sort(rel_paths)
                 for _, rel_path in ipairs(rel_paths) do
+                    module.private.yield_if_needed()
                     local body = files[rel_path]
                     local abs_path = vim.fs.normalize(ws_norm .. "/" .. rel_path)
                     local folded = indexers.fold_case(abs_path)
@@ -277,7 +433,7 @@ module.public = {
         -- the marker file are ever deleted.
         for _, dir in ipairs(dirs_to_delete) do
             if vim.fn.isdirectory(dir) == 1 and indexers.has_marker(dir) then
-                vim.fn.delete(dir, "rf")
+                module.private.delete_tree(dir)
             end
         end
         for _, update in ipairs(partial_updates) do
@@ -285,6 +441,7 @@ module.public = {
         end
         -- Mark generated directories before writing their files.
         for _, dir in ipairs(marked_dirs) do
+            module.private.yield_if_needed()
             module.private.write_marker(dir)
         end
 
@@ -297,29 +454,82 @@ module.public = {
         end
 
         -- Write all files, preferring buffer updates for open files
+        progress:settle(#files_to_write)
+        module.private.last_write_count[ws_norm] = #files_to_write
         local disk_writes = {}
         for _, file_info in ipairs(files_to_write) do
+            module.private.yield_if_needed()
             local bufnr = module.private.find_open_buffer(file_info.path)
             if bufnr then
                 module.private.write_to_buffer(bufnr, file_info.content)
+                progress:advance()
             else
                 table.insert(disk_writes, file_info)
             end
         end
-        if #disk_writes > 0 then
-            module.private.write_files_async(disk_writes, function()
-                vim.schedule(function()
-                    utils.notify("Index generated at " .. index_path)
-                end)
+        module.private.write_files_async(disk_writes, function(errors)
+            vim.schedule(function()
+                if #errors > 0 then
+                    on_done("Errors writing files:\n" .. table.concat(errors, "\n"))
+                else
+                    on_done(nil)
+                end
             end)
-        else
-            utils.notify("Index generated at " .. index_path)
+        end, function()
+            progress:advance()
+        end)
+    end,
+
+    workspace_watchers = {},
+    -- Longest stretch of indexing work, in milliseconds, before the editor gets to handle input
+    -- and redraw.
+    slice_budget_ms = 8,
+    -- Coroutine of the running time-sliced work and when its current slice started.
+    slice_co = nil,
+    slice_started = 0,
+
+    --- Whether a time slice that started at `started` (vim.uv.hrtime) is used up.
+    --- @param started integer
+    --- @return boolean
+    slice_expired = function(started)
+        return (vim.uv.hrtime() - started) / 1e6 >= module.private.slice_budget_ms
+    end,
+
+    --- Run `fn` after the editor had a chance to handle pending input and redraw. A timer is used
+    --- rather than vim.schedule so that the event loop polls for input in between.
+    --- @param fn function
+    defer = function(fn)
+        vim.defer_fn(fn, 0)
+    end,
+
+    --- Run `fn` in time slices: `yield_if_needed` calls inside it pause it once a slice is used up
+    --- and it is resumed after the editor handled input. on_error(err) is called if it throws.
+    --- @param fn function
+    --- @param on_error fun(err: any)
+    run_sliced = function(fn, on_error)
+        local co = coroutine.create(fn)
+        local function step()
+            local outer_co, outer_started = module.private.slice_co, module.private.slice_started
+            module.private.slice_co = co
+            module.private.slice_started = vim.uv.hrtime()
+            local ok, err = coroutine.resume(co)
+            module.private.slice_co, module.private.slice_started = outer_co, outer_started
+            if not ok then
+                on_error(err)
+            elseif coroutine.status(co) == "suspended" then
+                module.private.defer(step)
+            end
+        end
+        step()
+    end,
+
+    --- Pause the running `run_sliced` work if its time slice is used up. Does nothing elsewhere.
+    yield_if_needed = function()
+        local co = coroutine.running()
+        if co and co == module.private.slice_co and module.private.slice_expired(module.private.slice_started) then
+            coroutine.yield()
         end
     end,
-}
-
-module.private = {
-    workspace_watchers = {},
     -- Per workspace root: PDF path (as written and resolved) -> .bib files whose `file` field
     -- resolves to it, whether or not the PDF exists.
     pdf_bibs = {},
@@ -435,6 +645,7 @@ module.private = {
             ancestors[real] = true
             local handle = vim.uv.fs_scandir(dir)
             while handle do
+                module.private.yield_if_needed()
                 local name, kind = vim.uv.fs_scandir_next(handle)
                 if not name then
                     break
@@ -514,6 +725,31 @@ module.private = {
             return "empty"
         end
         return "foreign"
+    end,
+
+    --- Delete a directory recursively, like `delete(dir, "rf")`, pausing time-sliced work between
+    --- entries. Symbolic links are removed, not followed.
+    --- @param dir string absolute directory path
+    delete_tree = function(dir)
+        local handle = vim.uv.fs_scandir(dir)
+        while handle do
+            module.private.yield_if_needed()
+            local name, kind = vim.uv.fs_scandir_next(handle)
+            if not name then
+                break
+            end
+            local path = dir .. "/" .. name
+            if kind == nil then
+                local stat = vim.uv.fs_lstat(path)
+                kind = stat and stat.type
+            end
+            if kind == "directory" then
+                module.private.delete_tree(path)
+            else
+                vim.uv.fs_unlink(path)
+            end
+        end
+        vim.uv.fs_rmdir(dir)
     end,
 
     --- Create an indexer directory and its marker file.
@@ -719,34 +955,99 @@ module.private = {
         return data
     end,
 
-    --- Get a buffer suitable for treesitter operations on a file.
-    --- If the buffer is already open and loaded, returns it directly.
-    --- Otherwise, reads the file with vim.uv and creates a hidden scratch buffer
-    --- with the content for treesitter parsing.
-    --- @param abs_path string absolute file path
-    --- @return number|nil bufnr buffer number, or nil if file can't be read
-    --- @return boolean created_scratch true if a scratch buffer was created (caller should delete it)
-    get_or_create_treesitter_buffer = function(abs_path)
+    --- Read entire file contents using vim.uv (asynchronous).
+    --- @param path string absolute file path
+    --- @param callback fun(data: string|nil) called from a libuv callback; data is nil on error
+    read_file_async = function(path, callback)
+        -- The asynchronous forms return nil without calling back when a request cannot start.
+        local function close(fd, data)
+            local closing = vim.uv.fs_close(fd, function()
+                callback(data)
+            end)
+            if not closing then
+                callback(data)
+            end
+        end
+        -- 438 is octal 0666 (rw-rw-rw-), the standard permission for files
+        local opened = vim.uv.fs_open(path, "r", 438, function(open_err, fd)
+            if open_err or not fd then
+                callback(nil)
+                return
+            end
+            local stat_started = vim.uv.fs_fstat(fd, function(stat_err, stat)
+                if stat_err or not stat then
+                    close(fd, nil)
+                    return
+                end
+                local read_started = vim.uv.fs_read(fd, stat.size, 0, function(read_err, data)
+                    close(fd, not read_err and data or nil)
+                end)
+                if not read_started then
+                    close(fd, nil)
+                end
+            end)
+            if not stat_started then
+                close(fd, nil)
+            end
+        end)
+        if not opened then
+            callback(nil)
+        end
+    end,
+
+    --- The loaded buffer of a file, if any.
+    --- @param abs_path string normalized absolute file path
+    --- @return number|nil bufnr
+    loaded_buffer = function(abs_path)
         local bufnr = vim.fn.bufnr(abs_path)
         if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
             -- Verify the buffer actually corresponds to the requested file
             local buf_name = vim.fs.normalize(vim.fs.abspath(vim.api.nvim_buf_get_name(bufnr)))
             if buf_name == abs_path then
-                return bufnr, false
+                return bufnr
             end
+        end
+        return nil
+    end,
+
+    --- Get a buffer suitable for treesitter operations on a file.
+    --- If the buffer is already open and loaded, returns it directly.
+    --- Otherwise, reads the file with vim.uv and creates a hidden scratch buffer
+    --- with the content for treesitter parsing.
+    --- @param abs_path string absolute file path
+    --- @param content string|false|nil file contents already read (false: unreadable), read when nil
+    --- @return number|nil bufnr buffer number, or nil if file can't be read
+    --- @return boolean created_scratch true if a scratch buffer was created (caller should delete it)
+    get_or_create_treesitter_buffer = function(abs_path, content)
+        local bufnr = module.private.loaded_buffer(abs_path)
+        if bufnr then
+            return bufnr, false
         end
 
         -- Read file contents with vim.uv
-        local content = module.private.read_file_contents(abs_path)
+        if content == nil then
+            content = module.private.read_file_contents(abs_path)
+        end
         if not content then
             return nil, false
         end
 
-        -- Create scratch buffer with file content
-        local scratch = vim.api.nvim_create_buf(false, true)
-        local lines = vim.split(content, "\n", { plain = true })
-        vim.api.nvim_buf_set_lines(scratch, 0, -1, false, lines)
-        vim.bo[scratch].filetype = "norg"
+        -- Create a scratch buffer with the file content. Autocommands are skipped and no filetype is
+        -- set: parsers are requested with an explicit language, and running FileType handlers
+        -- (Neorg, highlighting, completion, ...) for every note would block the editor.
+        local eventignore = vim.o.eventignore
+        vim.o.eventignore = "all"
+        local ok, scratch = pcall(vim.api.nvim_create_buf, false, true)
+        if ok then
+            ok, scratch = pcall(function()
+                vim.api.nvim_buf_set_lines(scratch, 0, -1, false, vim.split(content, "\n", { plain = true }))
+                return scratch
+            end)
+        end
+        vim.o.eventignore = eventignore
+        if not ok then
+            error(scratch)
+        end
 
         return scratch, true
     end,
@@ -825,97 +1126,208 @@ module.private = {
         return (text:gsub("\\(.)", "%1"))
     end,
 
-    --- Collect entries from norg files. Metadata is read once and shared by all indexers.
+    --- Collect entries from norg and bib files. Metadata is read once and shared by all indexers.
     --- Paths are not resolved: a symlinked note is indexed under its path in the workspace.
+    --- Files are read with libuv, a bounded number at a time, and parsed on the main loop in their
+    --- order, so entries are deterministic.
     --- @param files string[] list of absolute file paths
     --- @param roots string[] normalized workspace roots (unresolved first, then resolved)
     --- @param index_rel string main index path relative to the workspace root
     --- @param skip_dirs string[] generated directories relative to the workspace root
-    --- @return table[] entries
-    collect_entries = function(files, roots, index_rel, skip_dirs)
-        local ts = module.required["core.integrations.treesitter"]
+    --- @param expected_writes integer|nil estimated number of files to write, defaults to #files
+    --- @param progress table progress notification, advanced per collected file
+    --- @param on_done fun(entries: table[]|nil, err: string|nil) called once, on the main loop
+    collect_entries_async = function(files, roots, index_rel, skip_dirs, expected_writes, progress, on_done)
+        local items = module.private.source_items(files, roots, index_rel, skip_dirs)
+        progress:add_total(#items)
+        -- Files to write are counted once the trees are built; until then assume as many as the
+        -- last run wrote, or about as many as files to read.
+        progress:expect(expected_writes or #items)
         local entries = {}
-        local bib_available = nil
+        local state = {}
+        -- contents[i] is the content of items[i] (false: unreadable, nil: read from its buffer);
+        -- ready[i] is true once it is available.
+        local contents, ready = {}, {}
+        local next_read, next_parse, in_flight = 1, 1, 0
+        local finished = false
+        local parse_deferred = false
 
+        local function finish(result, err)
+            if not finished then
+                finished = true
+                on_done(result, err)
+            end
+        end
+        -- Run a step of the collection; an error ends it.
+        local function guard(step)
+            local ok, err = pcall(step)
+            if not ok then
+                finish(nil, tostring(err))
+            end
+        end
+
+        local function parse_ready()
+            if parse_deferred then
+                return
+            end
+            local started = vim.uv.hrtime()
+            local parsed = 0
+            while not finished and ready[next_parse] do
+                -- At least one file is parsed per slice.
+                if parsed > 0 and module.private.slice_expired(started) then
+                    -- Let the editor handle input and redraw before parsing more.
+                    parse_deferred = true
+                    module.private.defer(function()
+                        parse_deferred = false
+                        guard(parse_ready)
+                    end)
+                    return
+                end
+                local i = next_parse
+                next_parse = i + 1
+                local content = contents[i]
+                contents[i] = nil
+                parsed = parsed + 1
+                local entry = module.private.collect_entry(items[i], content, state)
+                if entry then
+                    table.insert(entries, entry)
+                end
+                progress:advance()
+            end
+            if next_parse > #items then
+                finish(entries)
+            end
+        end
+
+        local function pump()
+            while not finished and in_flight < module.private.read_concurrency and next_read <= #items do
+                local i = next_read
+                next_read = i + 1
+                local item = items[i]
+                if not item.rel:match("%.bib$") and module.private.loaded_buffer(item.abs_path) then
+                    ready[i] = true
+                else
+                    in_flight = in_flight + 1
+                    module.private.read_file_async(item.abs_path, function(data)
+                        vim.schedule(function()
+                            guard(function()
+                                in_flight = in_flight - 1
+                                contents[i] = data or false
+                                ready[i] = true
+                                pump()
+                                parse_ready()
+                            end)
+                        end)
+                    end)
+                end
+            end
+        end
+
+        vim.schedule(function()
+            guard(function()
+                pump()
+                parse_ready()
+            end)
+        end)
+    end,
+
+    --- Source files to collect entries from, in order, as { abs_path, rel } items.
+    --- @param files string[] list of absolute file paths
+    --- @param roots string[] normalized workspace roots (unresolved first, then resolved)
+    --- @param index_rel string main index path relative to the workspace root
+    --- @param skip_dirs string[] generated directories relative to the workspace root
+    --- @return table[] items
+    source_items = function(files, roots, index_rel, skip_dirs)
+        local items = {}
         for _, file in ipairs(files) do
             local abs_path = vim.fs.normalize(vim.fs.abspath(tostring(file)))
             local rel = module.private.get_relative_path(abs_path, roots)
-
             -- Skip files outside the workspace, the main index file, and generated index directories
-            if not rel or module.private.is_generated_path(rel, index_rel, skip_dirs) then
-                goto continue
+            if rel and not module.private.is_generated_path(rel, index_rel, skip_dirs) then
+                table.insert(items, { abs_path = abs_path, rel = rel })
             end
+        end
+        return items
+    end,
 
-            if rel:match("%.bib$") then
-                if bib_available == nil then
-                    bib_available = bibtex.available()
-                    if not bib_available then
-                        bibtex.warn_unavailable(utils.notify)
-                    end
-                end
-                if bib_available then
-                    local entry = module.private.collect_literature(abs_path, rel)
-                    if entry then
-                        table.insert(entries, entry)
-                    end
-                end
-                goto continue
-            end
+    --- Collect the entry of one source file.
+    --- @param item table { abs_path, rel } from `source_items`
+    --- @param content string|false|nil file contents already read (false: unreadable), read when nil
+    --- @param state table shared by the files of one collection
+    --- @return table|nil entry
+    collect_entry = function(item, content, state)
+        local ts = module.required["core.integrations.treesitter"]
+        local abs_path, rel = item.abs_path, item.rel
 
-            -- Get a buffer for treesitter (existing or scratch)
-            local bufnr, created_scratch = module.private.get_or_create_treesitter_buffer(abs_path)
-            if not bufnr then
-                goto continue
-            end
-
-            local metadata = ts.get_document_metadata(bufnr) or {}
-
-            if created_scratch then
-                module.private.safe_buf_delete(bufnr)
-            end
-
-            -- Fall back to filename when no title is present in metadata
-            local title = (metadata.title ~= vim.NIL and metadata.title ~= "") and metadata.title
-                or vim.fs.basename(abs_path):gsub("%.norg$", "")
-
-            local description = (metadata.description ~= vim.NIL) and metadata.description
-
-            local created = (metadata.created ~= vim.NIL and metadata.created ~= "") and metadata.created or nil
-            local updated = (metadata.updated ~= vim.NIL and metadata.updated ~= "") and metadata.updated or nil
-
-            -- Build normalized metadata for the title_formatter callback
-            local norm_meta = {}
-            for k, v in pairs(metadata) do
-                if v ~= vim.NIL then
-                    norm_meta[k] = v
+        if rel:match("%.bib$") then
+            if state.bib_available == nil then
+                state.bib_available = bibtex.available()
+                if not state.bib_available then
+                    bibtex.warn_unavailable(utils.notify)
                 end
             end
-            norm_meta.title = title -- ensure resolved title is available
-
-            table.insert(entries, {
-                kind = "note",
-                abs_path = abs_path,
-                rel = rel,
-                title = title,
-                norgname = module.private.get_norgname(rel),
-                description = description,
-                created = type(created) == "string" and created or nil,
-                updated = type(updated) == "string" and updated or nil,
-                metadata = norm_meta,
-            })
-
-            ::continue::
+            if state.bib_available then
+                return module.private.collect_literature(abs_path, rel, content)
+            end
+            return nil
         end
 
-        return entries
+        -- Get a buffer for treesitter (existing or scratch)
+        local bufnr, created_scratch = module.private.get_or_create_treesitter_buffer(abs_path, content)
+        if not bufnr then
+            return nil
+        end
+
+        -- Delete the scratch buffer even when parsing fails.
+        local ok, metadata = pcall(ts.get_document_metadata, bufnr)
+        if created_scratch then
+            module.private.safe_buf_delete(bufnr)
+        end
+        if not ok then
+            error(metadata, 0)
+        end
+        metadata = metadata or {}
+
+        -- Fall back to filename when no title is present in metadata
+        local title = (metadata.title ~= vim.NIL and metadata.title ~= "") and metadata.title
+            or vim.fs.basename(abs_path):gsub("%.norg$", "")
+
+        local description = (metadata.description ~= vim.NIL) and metadata.description
+
+        local created = (metadata.created ~= vim.NIL and metadata.created ~= "") and metadata.created or nil
+        local updated = (metadata.updated ~= vim.NIL and metadata.updated ~= "") and metadata.updated or nil
+
+        -- Build normalized metadata for the title_formatter callback
+        local norm_meta = {}
+        for k, v in pairs(metadata) do
+            if v ~= vim.NIL then
+                norm_meta[k] = v
+            end
+        end
+        norm_meta.title = title -- ensure resolved title is available
+
+        return {
+            kind = "note",
+            abs_path = abs_path,
+            rel = rel,
+            title = title,
+            norgname = module.private.get_norgname(rel),
+            description = description,
+            created = type(created) == "string" and created or nil,
+            updated = type(updated) == "string" and updated or nil,
+            metadata = norm_meta,
+        }
     end,
 
     --- Read the literature entry of a .bib file: its first BibTeX entry.
     --- @param abs_path string normalized absolute path
     --- @param rel string path relative to the workspace root
+    --- @param source string|false|nil file contents already read (false: unreadable), read when nil
     --- @return table|nil entry, nil when the file has no entry
-    collect_literature = function(abs_path, rel)
-        local source = module.private.read_file_contents(abs_path)
+    collect_literature = function(abs_path, rel, source)
+        if source == nil then
+            source = module.private.read_file_contents(abs_path)
+        end
         if not source then
             return nil
         end
@@ -1746,30 +2158,47 @@ module.private = {
     --- Write a single file asynchronously.
     --- callback(err) is called on completion; err is nil on success.
     write_file_async = function(path, content, callback)
+        -- The asynchronous forms return nil and an error without calling back when a request
+        -- cannot start.
+        local function close(fd, write_err)
+            local function done(close_err)
+                if write_err then
+                    callback("Failed to write " .. path .. ": " .. tostring(write_err))
+                elseif close_err then
+                    callback("Failed to close " .. path .. ": " .. tostring(close_err))
+                else
+                    callback(nil)
+                end
+            end
+            local closing, close_err = vim.uv.fs_close(fd, done)
+            if not closing then
+                done(close_err or "unknown error")
+            end
+        end
         -- 438 is octal 0666 (rw-rw-rw-), the standard permission for new files
-        vim.uv.fs_open(path, "w", 438, function(open_err, fd)
-            if open_err then
-                callback("Failed to open " .. path .. ": " .. open_err)
+        local opened, err = vim.uv.fs_open(path, "w", 438, function(open_err, fd)
+            if open_err or not fd then
+                callback("Failed to open " .. path .. ": " .. tostring(open_err))
                 return
             end
-            vim.uv.fs_write(fd, content, nil, function(write_err, _)
-                vim.uv.fs_close(fd, function(close_err)
-                    if write_err then
-                        callback("Failed to write " .. path .. ": " .. write_err)
-                    elseif close_err then
-                        callback("Failed to close " .. path .. ": " .. close_err)
-                    else
-                        callback(nil)
-                    end
-                end)
+            local writing, write_err = vim.uv.fs_write(fd, content, nil, function(async_write_err, _)
+                close(fd, async_write_err)
             end)
+            if not writing then
+                close(fd, write_err or "unknown error")
+            end
         end)
+        if not opened then
+            callback("Failed to open " .. path .. ": " .. tostring(err))
+        end
     end,
 
-    --- Write multiple files asynchronously, calling on_done when all complete.
-    write_files_async = function(files, on_done)
+    --- Write multiple files asynchronously. on_progress() is called after each file and
+    --- on_done(errors) once all are written; errors lists the failures (empty on success).
+    --- Both are called from libuv callbacks.
+    write_files_async = function(files, on_done, on_progress)
         if #files == 0 then
-            on_done()
+            on_done({})
             return
         end
 
@@ -1782,14 +2211,11 @@ module.private = {
                     table.insert(errors, err)
                 end
                 completed = completed + 1
+                if on_progress then
+                    on_progress()
+                end
                 if completed == #files then
-                    if #errors > 0 then
-                        vim.schedule(function()
-                            utils.notify("Errors writing files:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
-                        end)
-                    else
-                        on_done()
-                    end
+                    on_done(errors)
                 end
             end)
         end

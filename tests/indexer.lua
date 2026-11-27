@@ -97,6 +97,8 @@ local function run()
                 config = {
                     index_on_launch = true,
                     index_on_change = false,
+                    -- The progress bar is tested in tests/progress.lua; only final messages are awaited here.
+                    progress = { enabled = false },
                     -- Removed option: warned about and ignored.
                     categories = { name = "old.norg" },
                 },

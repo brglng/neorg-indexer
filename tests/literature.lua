@@ -237,7 +237,8 @@ local function run()
             ["core.neorgcmd"] = {},
             ["core.dirman"] = { config = { workspaces = { lit = ws } } },
             ["core.integrations.treesitter"] = { config = { configure_parsers = false } },
-            ["external.indexer"] = { config = { index_on_change = false } },
+            -- The progress bar is tested in tests/progress.lua; only final messages are awaited here.
+            ["external.indexer"] = { config = { index_on_change = false, progress = { enabled = false } } },
         },
     })
     local modules = require("neorg.core").modules

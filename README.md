@@ -409,6 +409,20 @@ Set these options under `load["external.indexer"].config` in your Neorg setup.
 | `name` | string | `"index.norg"` | Name of the main index file, relative to the workspace root. |
 | `index_on_launch` | boolean | `false` | When `true`, generate indexes for the active named workspace when the module loads. |
 | `index_on_change` | boolean | `true` | When `true`, regenerate indexes when workspace `.norg` or `.bib` files (or the PDFs of literatures) change. |
+| `progress.enabled` | boolean | `true` | When `true`, show a progress bar while indexes are generated. When `false`, only the final message is shown. `progress = false` is the same as `progress = { enabled = false }`. |
+| `progress.delay_ms` | integer | `300` | Show the progress bar only when generating indexes takes longer than this many milliseconds. |
+
+The progress bar is a single notification, updated in place:
+`⠹ Indexing notes ▕██████░░░░▏ 60% (120/200)`, counting the files read and
+written. When generation finishes, `✓ Index generated at <path>` replaces it.
+Updates call `vim.notify` with a stable `id` and `replace` set to the previous
+notification, which nvim-notify, snacks.nvim, and noice.nvim support. If
+`vim.notify` returns no notification to replace (the built-in `vim.notify`),
+Neovim's native progress messages (`nvim_echo()` with `kind = "progress"`) are
+used instead. Index requests made while a workspace is being indexed are
+merged into one follow-up run, which reuses the same notification. Indexing
+runs in the background: files are read asynchronously and the remaining work is
+split into short slices, so the editor keeps responding to input meanwhile.
 
 To index at startup, set `default_workspace` in `core.dirman` to the name of a
 configured workspace. Add these entries to your Neorg `load` table, replacing
